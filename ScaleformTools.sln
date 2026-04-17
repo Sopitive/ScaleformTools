@@ -1,0 +1,29 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "desktop", "desktop", "{7A1224A0-F22D-34FF-DE0A-A058FAFFD90C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ScaleformTools", "desktop\ScaleformTools.csproj", "{5F6A468A-A878-1D9B-97D9-A8FBA44817CF}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5F6A468A-A878-1D9B-97D9-A8FBA44817CF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5F6A468A-A878-1D9B-97D9-A8FBA44817CF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5F6A468A-A878-1D9B-97D9-A8FBA44817CF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5F6A468A-A878-1D9B-97D9-A8FBA44817CF}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{5F6A468A-A878-1D9B-97D9-A8FBA44817CF} = {7A1224A0-F22D-34FF-DE0A-A058FAFFD90C}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {BFD2A8C4-F25D-455D-8B0A-FEE9CCBD2B21}
+	EndGlobalSection
+EndGlobal

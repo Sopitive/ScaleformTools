@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local dev artifacts
+*.local
+
+# Debug / scratch files
+Backups/
+preview.json
+shape_detail.json
+shape_dump.json
+
+# Desktop build artifacts
+desktop/bin/
+desktop/obj/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

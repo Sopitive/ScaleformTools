@@ -1,0 +1,141 @@
+<Window x:Class="ScaleformTools.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+        Title="Scaleform Tools"
+        Width="1700" Height="960"
+        MinWidth="1100" MinHeight="640"
+        Background="#0a0a0c"
+        WindowStyle="None"
+        ResizeMode="CanResize"
+        WindowStartupLocation="CenterScreen">
+
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="36"
+                      ResizeBorderThickness="6"
+                      GlassFrameThickness="0"
+                      NonClientFrameEdges="None"
+                      UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
+
+    <Window.Resources>
+        <Style x:Key="TitleBtn" TargetType="Button">
+            <Setter Property="Width"           Value="46"/>
+            <Setter Property="Height"          Value="36"/>
+            <Setter Property="Background"      Value="Transparent"/>
+            <Setter Property="Foreground"      Value="#94a3b8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="FontSize"        Value="13"/>
+            <Setter Property="FontFamily"      Value="Segoe UI"/>
+            <Setter Property="Focusable"       Value="False"/>
+            <Setter Property="WindowChrome.IsHitTestVisibleInChrome" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="bg" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="bg" Property="Background" Value="#25252b"/>
+                                <Setter Property="Foreground" Value="#f8fafc"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="bg" Property="Background" Value="#1e1e22"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="TitleBtnClose" TargetType="Button" BasedOn="{StaticResource TitleBtn}">
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="bg" Background="{TemplateBinding Background}">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="bg" Property="Background" Value="#ef4444"/>
+                                <Setter Property="Foreground" Value="White"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="bg" Property="Background" Value="#dc2626"/>
+                                <Setter Property="Foreground" Value="White"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="36"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Custom title bar -->
+        <Grid Grid.Row="0" Background="#141417">
+            <Rectangle Height="1" VerticalAlignment="Bottom" Fill="#2d2d33"/>
+
+            <StackPanel Orientation="Horizontal"
+                        VerticalAlignment="Center"
+                        Margin="14,0,0,0">
+                <Ellipse Width="8" Height="8" Fill="#6366f1" Margin="0,0,9,0"/>
+                <TextBlock Text="Scaleform Tools"
+                           FontSize="12" FontWeight="SemiBold"
+                           FontFamily="Segoe UI"
+                           Foreground="#f8fafc"
+                           VerticalAlignment="Center"/>
+            </StackPanel>
+
+            <StackPanel Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        WindowChrome.IsHitTestVisibleInChrome="True">
+                <Button x:Name="btnMinimize"
+                        Content="─"
+                        Style="{StaticResource TitleBtn}"
+                        Click="BtnMinimize_Click"/>
+                <Button x:Name="btnMaximize"
+                        Content="□"
+                        Style="{StaticResource TitleBtn}"
+                        Click="BtnMaximize_Click"/>
+                <Button x:Name="btnClose"
+                        Content="✕"
+                        Style="{StaticResource TitleBtnClose}"
+                        Click="BtnClose_Click"/>
+            </StackPanel>
+        </Grid>
+
+        <!-- WebView2 fills the rest -->
+        <wv2:WebView2 x:Name="webView"
+                      Grid.Row="1"
+                      DefaultBackgroundColor="#0a0a0c"/>
+
+        <!-- Loading overlay shown while WebView2 initialises -->
+        <Border x:Name="loadingOverlay"
+                Grid.Row="1"
+                Background="#0a0a0c"
+                Visibility="Visible">
+            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                <TextBlock Text="Scaleform Tools"
+                           FontSize="28" FontWeight="Bold"
+                           FontFamily="Segoe UI"
+                           Foreground="#6366f1"
+                           HorizontalAlignment="Center"/>
+                <TextBlock Text="Loading…"
+                           FontSize="14"
+                           FontFamily="Segoe UI"
+                           Foreground="#64748b"
+                           HorizontalAlignment="Center"
+                           Margin="0,12,0,0"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>
