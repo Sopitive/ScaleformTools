@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import {
   parsePerm,
+  parseIdx,
   loadPixels,
   makeDDS,
   writePackPatches,
@@ -25,6 +26,36 @@ import {
   TexFmt,
 } from '../lib/texturePack';
 import { decodeDDSPixels, decodedToDataURL, parseDDSHeader, stripDDSHeader } from '../lib/ddsDecoder';
+import { isNative, nativeOpenTexturePack } from '../lib/native';
+
+// ─── Error boundary ───────────────────────────────────────────────────────────
+
+class TextureEditorErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: string | null }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(e: Error) { return { error: e.message }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '0.75rem', color: 'var(--text-secondary)', padding: '2rem' }}>
+          <div style={{ fontSize: '0.9rem', fontWeight: 700, color: 'var(--error)' }}>Texture editor error</div>
+          <div style={{ fontSize: '0.75rem', fontFamily: 'monospace', background: 'var(--bg-tertiary)', padding: '0.75rem 1rem', borderRadius: '6px', maxWidth: '480px', wordBreak: 'break-all' }}>
+            {this.state.error}
+          </div>
+          <button className="btn btn-secondary" style={{ fontSize: '0.7rem' }} onClick={() => this.setState({ error: null })}>
+            Dismiss
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // ─── Format display helpers ────────────────────────────────────────────────
 
@@ -59,51 +90,86 @@ function fmtBadgeColor(fmt: number): string {
   return '#64748b';
 }
 
-// ─── Per-entry preview ─────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────
 
-function useTexturePreview(entry: TextureEntry | null, tempBytes: Uint8Array | null): string | null {
-  const [url, setUrl] = React.useState<string | null>(null);
-  const prevRef = React.useRef<{ entryIdx: number; url: string } | null>(null);
-
-  React.useEffect(() => {
-    if (!entry || !tempBytes) { setUrl(null); return; }
-    if (prevRef.current?.entryIdx === entry.index) { setUrl(prevRef.current.url); return; }
-
-    const pixels = loadPixels(entry, tempBytes);
-    try {
-      const decoded = decodeDDSPixels(pixels, entry.width, entry.height, entry.format);
-      const dataUrl = decodedToDataURL(decoded);
-      prevRef.current = { entryIdx: entry.index, url: dataUrl };
-      setUrl(dataUrl);
-    } catch {
-      setUrl(null);
-    }
-  }, [entry, tempBytes]);
-
-  return url;
+/** Decode pixels and produce a revocable Blob URL (stored outside the JS heap). */
+function decodeToObjectURL(
+  entry: TextureEntry,
+  pixelBytes: Uint8Array,
+  embedded: boolean,
+  idxOffset: number | undefined,
+  onUrl: (url: string) => void,
+  onFail: (e: unknown) => void,
+): void {
+  try {
+    const pixels = loadPixels(entry, pixelBytes, embedded, idxOffset);
+    const decoded = decodeDDSPixels(pixels, entry.width, entry.height, entry.format);
+    const canvas = document.createElement('canvas');
+    canvas.width = decoded.width;
+    canvas.height = decoded.height;
+    const ctx = canvas.getContext('2d')!;
+    ctx.putImageData(
+      new ImageData(new Uint8ClampedArray(decoded.rgba.buffer as ArrayBuffer), decoded.width, decoded.height),
+      0, 0,
+    );
+    canvas.toBlob(blob => {
+      if (!blob) { onFail(new Error('toBlob returned null')); return; }
+      onUrl(URL.createObjectURL(blob));
+    }, 'image/png');
+  } catch (e) {
+    onFail(e);
+  }
 }
 
-// ─── Thumbnail component (lazy-decodes on mount) ─────────────────────────
+// ─── Thumbnail component ────────────────────────────────────────────────────
+// Decodes only when scrolled into view (IntersectionObserver).
+// Stores decoded image as a Blob URL so it lives outside the JS heap and can
+// be explicitly revoked when the thumbnail unmounts or the pack changes.
 
-const TextureThumbnail: React.FC<{ entry: TextureEntry; tempBytes: Uint8Array; isPending: boolean; onClick: () => void; selected: boolean }> =
-  ({ entry, tempBytes, isPending, onClick, selected }) => {
+const TextureThumbnail: React.FC<{ entry: TextureEntry; pixelBytes: Uint8Array | null; embedded: boolean; idxOffset: number | undefined; isPending: boolean; onClick: () => void; selected: boolean }> =
+  ({ entry, pixelBytes, embedded, idxOffset, isPending, onClick, selected }) => {
   const [url, setUrl] = useState<string | null>(null);
-  const decoded = useRef(false);
+  const [failed, setFailed] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const blobUrl = useRef<string | null>(null);
 
+  const revokeBlobUrl = () => {
+    if (blobUrl.current) { URL.revokeObjectURL(blobUrl.current); blobUrl.current = null; }
+  };
+
+  // Revoke and re-decode whenever entry or pixel source changes.
   React.useEffect(() => {
-    if (decoded.current) return;
-    decoded.current = true;
-    const pixels = loadPixels(entry, tempBytes);
-    try {
-      const img = decodeDDSPixels(pixels, entry.width, entry.height, entry.format);
-      setUrl(decodedToDataURL(img));
-    } catch {
-      setUrl(null);
-    }
-  }, [entry, tempBytes]);
+    revokeBlobUrl();
+    setUrl(null);
+    setFailed(false);
+    if (!pixelBytes || !containerRef.current) return;
+
+    let cancelled = false;
+
+    const decode = () => {
+      if (cancelled || blobUrl.current) return;
+      decodeToObjectURL(
+        entry, pixelBytes, embedded, idxOffset,
+        objUrl => { if (cancelled) { URL.revokeObjectURL(objUrl); return; } blobUrl.current = objUrl; setUrl(objUrl); },
+        e => { if (!cancelled) { console.warn(`[thumbnail] ${entry.name}:`, e); setFailed(true); } },
+      );
+    };
+
+    const observer = new IntersectionObserver(
+      ([obs]) => { if (obs.isIntersecting) decode(); },
+      { rootMargin: '400px' }, // pre-load a bit ahead of viewport
+    );
+    observer.observe(containerRef.current);
+
+    return () => { cancelled = true; observer.disconnect(); };
+  }, [entry.index, pixelBytes, embedded, idxOffset]);
+
+  // Final unmount cleanup.
+  React.useEffect(() => () => revokeBlobUrl(), []);
 
   return (
     <div
+      ref={containerRef}
       onClick={onClick}
       style={{
         display: 'flex', flexDirection: 'column',
@@ -122,8 +188,10 @@ const TextureThumbnail: React.FC<{ entry: TextureEntry; tempBytes: Uint8Array; i
             style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'contain', imageRendering: 'pixelated' }}
           />
         ) : (
-          <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: '0.6rem' }}>
-            <RefreshCw size={16} style={{ opacity: 0.4 }} />
+          <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-muted)', fontSize: '0.55rem' }}>
+            {failed
+              ? <span style={{ opacity: 0.5, textAlign: 'center', padding: '4px' }}>no preview</span>
+              : <RefreshCw size={16} style={{ opacity: 0.4 }} />}
           </div>
         )}
         {isPending && (
@@ -151,20 +219,41 @@ const TextureThumbnail: React.FC<{ entry: TextureEntry; tempBytes: Uint8Array; i
 
 const TextureDetailPanel: React.FC<{
   entry: TextureEntry;
-  tempBytes: Uint8Array;
+  pixelBytes: Uint8Array;
+  embedded: boolean;
+  idxOffset: number | undefined;
   pendingPixels: Uint8Array | null;
   onImport: (file: File) => void;
   onExportDDS: () => void;
   onExportPNG: () => void;
   onClearPending: () => void;
-}> = ({ entry, tempBytes, pendingPixels, onImport, onExportDDS, onExportPNG, onClearPending }) => {
-  const pixelsForDisplay = pendingPixels ?? loadPixels(entry, tempBytes);
-  const decoded = React.useMemo(() => {
-    try { return decodeDDSPixels(pixelsForDisplay, entry.width, entry.height, entry.format); }
-    catch { return null; }
-  }, [pixelsForDisplay, entry]);
+}> = ({ entry, pixelBytes, embedded, idxOffset, pendingPixels, onImport, onExportDDS, onExportPNG, onClearPending }) => {
+  const [previewUrl, setPreviewUrl] = React.useState<string | null>(null);
+  const blobUrl = useRef<string | null>(null);
 
-  const previewUrl = React.useMemo(() => decoded ? decodedToDataURL(decoded) : null, [decoded]);
+  React.useEffect(() => {
+    if (blobUrl.current) { URL.revokeObjectURL(blobUrl.current); blobUrl.current = null; }
+    setPreviewUrl(null);
+    let cancelled = false;
+    try {
+      const pixels = pendingPixels ?? loadPixels(entry, pixelBytes, embedded, idxOffset);
+      const decoded = decodeDDSPixels(pixels, entry.width, entry.height, entry.format);
+      const canvas = document.createElement('canvas');
+      canvas.width = decoded.width; canvas.height = decoded.height;
+      const ctx = canvas.getContext('2d')!;
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(decoded.rgba.buffer as ArrayBuffer), decoded.width, decoded.height), 0, 0);
+      canvas.toBlob(blob => {
+        if (cancelled || !blob) return;
+        const objUrl = URL.createObjectURL(blob);
+        blobUrl.current = objUrl;
+        setPreviewUrl(objUrl);
+      }, 'image/png');
+    } catch { /* stays null */ }
+    return () => {
+      cancelled = true;
+      if (blobUrl.current) { URL.revokeObjectURL(blobUrl.current); blobUrl.current = null; }
+    };
+  }, [entry, pixelBytes, embedded, idxOffset, pendingPixels]);
 
   const importRef = useRef<HTMLInputElement>(null);
 
@@ -244,9 +333,11 @@ const TextureDetailPanel: React.FC<{
 
 // ─── Main component ────────────────────────────────────────────────────────
 
-export const TexturePackEditor: React.FC = () => {
+const TexturePackEditorInner: React.FC = () => {
+  const [packId, setPackId] = useState(0); // bumped on every new pack load; used as key to force thumbnail remount
   const [permBytes, setPermBytes] = useState<Uint8Array | null>(null);
   const [tempBytes, setTempBytes] = useState<Uint8Array | null>(null);
+  const [idxOffsets, setIdxOffsets] = useState<number[] | null>(null);
   const [permName, setPermName] = useState('');
   const [tempName, setTempName] = useState('');
   const [entries, setEntries] = useState<TextureEntry[]>([]);
@@ -259,6 +350,11 @@ export const TexturePackEditor: React.FC = () => {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Pixel data source: temp.bin for streaming packs, perm.bin for embedded packs (idx-only).
+  const pixelBytes = tempBytes ?? permBytes;
+  // When using perm.bin as pixel source, offsets are relative to each entry's dataBase.
+  const embedded = pixelBytes !== null && tempBytes === null;
+
   // ── File loading ─────────────────────────────────────────────────────────
 
   const parsePack = useCallback((perm: Uint8Array) => {
@@ -270,26 +366,29 @@ export const TexturePackEditor: React.FC = () => {
     }
   }, []);
 
-  // Accepts any mix of .perm.bin and .temp.bin files; ignores anything else
-  const handleFiles = useCallback(async (files: File[]) => {
+  // Core loader — accepts already-read { name, data } pairs
+  const handleFileData = useCallback((files: { name: string; data: Uint8Array }[]) => {
     let newPerm: Uint8Array | null = null;
     let newTemp: Uint8Array | null = null;
 
-    for (const f of files) {
-      if (f.name.endsWith('.perm.bin')) {
-        const buf = await f.arrayBuffer();
-        newPerm = new Uint8Array(buf);
-        setPermName(f.name);
+    for (const { name, data } of files) {
+      if (name.endsWith('.perm.bin')) {
+        newPerm = data;
+        setPermName(name);
+        setPackId(id => id + 1); // forces all old thumbnails to unmount → revokes their blob URLs
+        setPermBytes(null);      // release old buffer reference before assigning new one
+        setTempBytes(null);
+        setIdxOffsets(null);
         setEntries([]);
         setSelectedIdx(null);
         setPatches(new Map());
         setSaveStatus('idle');
-      } else if (f.name.endsWith('.temp.bin')) {
-        const buf = await f.arrayBuffer();
-        newTemp = new Uint8Array(buf);
-        setTempName(f.name);
+      } else if (name.endsWith('.temp.bin')) {
+        newTemp = data;
+        setTempName(name);
+      } else if (name.endsWith('.perm.idx')) {
+        setIdxOffsets(parseIdx(data));
       }
-      // silently ignore any other file types
     }
 
     if (newPerm) setPermBytes(newPerm);
@@ -298,6 +397,44 @@ export const TexturePackEditor: React.FC = () => {
     const permToUse = newPerm ?? permBytes;
     if (permToUse && (newPerm || newTemp)) parsePack(permToUse);
   }, [permBytes, parsePack]);
+
+  // Web fallback: read File objects then delegate
+  const handleFiles = useCallback(async (files: File[]) => {
+    const pairs = await Promise.all(
+      files.map(async f => ({ name: f.name, data: new Uint8Array(await f.arrayBuffer()) }))
+    );
+    handleFileData(pairs);
+  }, [handleFileData]);
+
+  // Button click: use native bridge in desktop app, fall back to <input> in browser
+  const handleLoadClick = useCallback(async () => {
+    if (isNative) {
+      try {
+        const result = await nativeOpenTexturePack();
+        if (result.cancelled || !result.host || !result.permName) return;
+
+        // Fetch files via the WebResourceRequested interceptor — streams from disk,
+        // no base64/JSON size limits, same-origin so no CORS issues.
+        const base = `https://${result.host}`;
+        const fetchBin = async (name: string): Promise<Uint8Array> => {
+          const res = await fetch(`${base}/${encodeURIComponent(name)}`);
+          if (!res.ok) throw new Error(`Failed to fetch ${name}: ${res.status}`);
+          return new Uint8Array(await res.arrayBuffer());
+        };
+
+        const pairs: { name: string; data: Uint8Array }[] = [];
+        pairs.push({ name: result.permName, data: await fetchBin(result.permName) });
+        if (result.tempName) pairs.push({ name: result.tempName, data: await fetchBin(result.tempName) });
+        if (result.idxName)  pairs.push({ name: result.idxName,  data: await fetchBin(result.idxName) });
+
+        handleFileData(pairs);
+      } catch (e) {
+        alert('Failed to open texture pack: ' + (e as Error).message);
+      }
+    } else {
+      fileInputRef.current?.click();
+    }
+  }, [handleFileData]);
 
   const handleFileInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = [...(e.target.files ?? [])];
@@ -378,15 +515,15 @@ export const TexturePackEditor: React.FC = () => {
   // ── Export ───────────────────────────────────────────────────────────────
 
   const handleExportDDS = useCallback((entry: TextureEntry, customPixels?: Uint8Array) => {
-    if (!tempBytes) return;
-    const pixels = customPixels ?? loadPixels(entry, tempBytes);
+    if (!pixelBytes) return;
+    const pixels = customPixels ?? loadPixels(entry, pixelBytes, embedded, idxOffsets?.[entry.index]);
     const dds = makeDDS(entry, pixels);
     downloadBytes(dds, `${entry.name || `tex_${entry.index}`}.dds`);
-  }, [tempBytes]);
+  }, [pixelBytes, embedded, idxOffsets]);
 
   const handleExportPNG = useCallback((entry: TextureEntry, customPixels?: Uint8Array) => {
-    if (!tempBytes) return;
-    const pixels = customPixels ?? loadPixels(entry, tempBytes);
+    if (!pixelBytes) return;
+    const pixels = customPixels ?? loadPixels(entry, pixelBytes, embedded, idxOffsets?.[entry.index]);
     try {
       const decoded = decodeDDSPixels(pixels, entry.width, entry.height, entry.format);
       const url = decodedToDataURL(decoded);
@@ -397,16 +534,16 @@ export const TexturePackEditor: React.FC = () => {
     } catch (e) {
       alert('Export PNG failed: ' + (e as Error).message);
     }
-  }, [tempBytes]);
+  }, [pixelBytes, embedded, idxOffsets]);
 
   // ── Save pack ────────────────────────────────────────────────────────────
 
   const handleSavePack = useCallback(async () => {
-    if (!permBytes || !tempBytes || patches.size === 0) return;
+    if (!permBytes || !pixelBytes || patches.size === 0) return;
     setSaveStatus('saving');
     try {
       const patchList = [...patches.values()];
-      const { permBytes: newPerm, tempBytes: newTemp } = writePackPatches(permBytes, tempBytes, patchList);
+      const { permBytes: newPerm, tempBytes: newTemp } = writePackPatches(permBytes, pixelBytes, patchList);
       downloadBytes(newPerm, permName || 'output.perm.bin');
       downloadBytes(newTemp, tempName || 'output.temp.bin');
       setSaveStatus('saved');
@@ -415,7 +552,7 @@ export const TexturePackEditor: React.FC = () => {
       setSaveStatus('error');
       alert('Save failed: ' + (e as Error).message);
     }
-  }, [permBytes, tempBytes, patches, permName, tempName]);
+  }, [permBytes, pixelBytes, patches, permName, tempName]);
 
   // ── Filtered + sorted entries ────────────────────────────────────────────
 
@@ -449,15 +586,16 @@ export const TexturePackEditor: React.FC = () => {
               <span style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--accent-secondary)' }}>Texture Pack</span>
             </div>
             {loaded && (
-              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>
-                {entries.length} textures
-                {patches.size > 0 && <span style={{ color: '#f59e0b', marginLeft: '8px' }}>• {patches.size} pending</span>}
+              <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span>{entries.length} textures</span>
+                {idxOffsets && <span style={{ color: 'var(--text-secondary)' }}>• idx ({idxOffsets.length} entries)</span>}
+                {patches.size > 0 && <span style={{ color: '#f59e0b' }}>• {patches.size} pending</span>}
               </span>
             )}
           </div>
 
           <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-            <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()} style={{ fontSize: '0.7rem', gap: '5px', padding: '5px 10px' }}>
+            <button className="btn btn-secondary" onClick={handleLoadClick} style={{ fontSize: '0.7rem', gap: '5px', padding: '5px 10px' }}>
               <Upload size={13} /> Load Texture Pack
             </button>
             <input ref={fileInputRef} type="file" accept=".bin" multiple style={{ display: 'none' }} onChange={handleFileInput} />
@@ -510,6 +648,14 @@ export const TexturePackEditor: React.FC = () => {
         )}
       </div>
 
+      {/* Warning: metadata loaded but no pixel data source found */}
+      {loaded && !pixelBytes && (
+        <div style={{ background: 'rgba(245,158,11,0.12)', borderBottom: '1px solid #f59e0b', padding: '6px 1rem', fontSize: '0.7rem', color: '#f59e0b', display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <span style={{ fontWeight: 700 }}>⚠</span>
+          No pixel data found. Load the matching <code style={{ background: 'rgba(0,0,0,0.2)', padding: '0 4px', borderRadius: '3px' }}>.temp.bin</code> or <code style={{ background: 'rgba(0,0,0,0.2)', padding: '0 4px', borderRadius: '3px' }}>.perm.idx</code> file.
+        </div>
+      )}
+
       {/* Body */}
       <div style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
         {!loaded ? (
@@ -532,7 +678,7 @@ export const TexturePackEditor: React.FC = () => {
               <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '1.5rem' }}>
                 Drop your <code style={{ background: 'var(--bg-tertiary)', padding: '1px 5px', borderRadius: '4px' }}>.perm.bin</code> and <code style={{ background: 'var(--bg-tertiary)', padding: '1px 5px', borderRadius: '4px' }}>.temp.bin</code> files here, or browse
               </div>
-              <button className="btn btn-secondary" onClick={() => fileInputRef.current?.click()} style={{ gap: '6px' }}>
+              <button className="btn btn-secondary" onClick={handleLoadClick} style={{ gap: '6px' }}>
                 <Upload size={14} /> Select Files
               </button>
             </div>
@@ -540,17 +686,19 @@ export const TexturePackEditor: React.FC = () => {
         ) : (
           <>
             {/* Texture grid */}
-            <div className="scroll-thin" style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
+            <div key={packId} className="scroll-thin" style={{ flex: 1, overflowY: 'auto', padding: '1rem' }}>
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))',
                 gap: '0.75rem',
               }}>
-                {filteredEntries.map((entry, i) => (
+                {filteredEntries.map((entry) => (
                   <TextureThumbnail
                     key={entry.index}
                     entry={entry}
-                    tempBytes={tempBytes!}
+                    pixelBytes={pixelBytes}
+                    embedded={embedded}
+                    idxOffset={idxOffsets?.[entry.index]}
                     isPending={patches.has(entry.index)}
                     selected={selectedEntry?.index === entry.index}
                     onClick={() => {
@@ -579,7 +727,9 @@ export const TexturePackEditor: React.FC = () => {
                 </div>
                 <TextureDetailPanel
                   entry={selectedEntry}
-                  tempBytes={tempBytes!}
+                  pixelBytes={pixelBytes!}
+                  embedded={embedded}
+                  idxOffset={idxOffsets?.[selectedEntry.index]}
                   pendingPixels={patches.get(selectedEntry.index)?.newPixels ?? null}
                   onImport={file => handleImport(file, selectedEntry)}
                   onExportDDS={() => handleExportDDS(selectedEntry, patches.get(selectedEntry.index)?.newPixels)}
@@ -598,6 +748,12 @@ export const TexturePackEditor: React.FC = () => {
 };
 
 // ─── Utility ──────────────────────────────────────────────────────────────
+
+export const TexturePackEditor: React.FC = () => (
+  <TextureEditorErrorBoundary>
+    <TexturePackEditorInner />
+  </TextureEditorErrorBoundary>
+);
 
 function downloadBytes(bytes: Uint8Array, filename: string) {
   const blob = new Blob([bytes.buffer as ArrayBuffer]);

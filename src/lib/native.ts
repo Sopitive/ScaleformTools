@@ -62,6 +62,15 @@ export interface OpenFileResult {
   dataBase64?: string;
 }
 
+export interface OpenTexturePackResult {
+  cancelled: boolean;
+  /** Virtual hostname mapped to the pack directory (e.g. "texturepacks.local"). */
+  host?: string;
+  permName?: string;
+  tempName?: string | null;
+  idxName?: string | null;
+}
+
 export interface SaveFileResult {
   cancelled: boolean;
   path?: string;
@@ -97,6 +106,14 @@ export interface LiveEditStatus {
  */
 export function nativeOpenFile(filter?: string): Promise<OpenFileResult> {
   return call('openFile', { filter: filter ?? 'GFX Files|*.gfx;*.GFX;*.swf|All Files|*.*' });
+}
+
+/**
+ * Opens a file dialog for .perm.bin and automatically reads the sibling .temp.bin
+ * from the same directory. Returns both files' bytes as base64.
+ */
+export function nativeOpenTexturePack(): Promise<OpenTexturePackResult> {
+  return call('openTexturePack');
 }
 
 /**

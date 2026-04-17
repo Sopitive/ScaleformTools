@@ -26,6 +26,12 @@ public sealed class NativeBridge : IDisposable
     private string? _liveSourcePath;
     private string  _liveBackupDir = DefaultBackupDir;
 
+    /// Directory currently serving pack files via the localpack:// resource handler.
+    private string? _packDirectory;
+
+    // URL prefix intercepted by WebResourceRequested — not a real domain, never resolves.
+    private const string PackFilePrefix = "https://localpack.invalid/";
+
     private static string DefaultBackupDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
                      "ScaleformTools", "Backups");
@@ -37,9 +43,37 @@ public sealed class NativeBridge : IDisposable
 
         _wv.WebMessageReceived += OnMessageReceived;
 
+        // Intercept all requests to https://localpack.invalid/* and serve them from
+        // _packDirectory on disk — avoids JSON/base64 size limits for large temp.bin files.
+        _wv.AddWebResourceRequestedFilter(PackFilePrefix + "*", CoreWebView2WebResourceContext.All);
+        _wv.WebResourceRequested += OnPackFileRequested;
+
         _liveEdit.StatusChanged += status =>
             _ = _wv.ExecuteScriptAsync(
                 $"window.__nativeBridge?.onLiveEditStatus({JsonSerializer.Serialize(status)});");
+    }
+
+    private void OnPackFileRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
+    {
+        if (_packDirectory == null) return;
+        try
+        {
+            var uri      = new Uri(e.Request.Uri);
+            var fileName = Uri.UnescapeDataString(uri.AbsolutePath.TrimStart('/'));
+
+            // Safety: reject any path traversal
+            var fullPath = Path.GetFullPath(Path.Combine(_packDirectory, fileName));
+            var fullDir  = Path.GetFullPath(_packDirectory);
+            if (!fullPath.StartsWith(fullDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return;
+            if (!File.Exists(fullPath)) return;
+
+            // Stream the file directly — no in-memory copy needed even for large files.
+            var stream   = File.OpenRead(fullPath);
+            e.Response   = _wv.Environment.CreateWebResourceResponse(
+                stream, 200, "OK",
+                "Content-Type: application/octet-stream\r\nAccess-Control-Allow-Origin: *\r\n");
+        }
+        catch { /* silently ignore; JS fetch will receive a network error */ }
     }
 
     private async void OnMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
@@ -62,14 +96,15 @@ public sealed class NativeBridge : IDisposable
 
             object? result = type switch
             {
-                "openFile"       => await HandleOpenFile(args),
-                "saveFile"       => await HandleSaveFile(args),
-                "saveFileDialog" => HandleSaveFileDialog(args),
-                "pickDirectory"  => HandlePickDirectory(),
-                "liveEditWrite"  => await HandleLiveEditWrite(args),
-                "setLiveSource"  => HandleSetLiveSource(args),
-                "getLiveStatus"  => GetLiveStatus(),
-                _                => throw new InvalidOperationException($"Unknown bridge type: {type}"),
+                "openFile"        => await HandleOpenFile(args),
+                "openTexturePack" => HandleOpenTexturePack(),
+                "saveFile"        => await HandleSaveFile(args),
+                "saveFileDialog"  => HandleSaveFileDialog(args),
+                "pickDirectory"   => HandlePickDirectory(),
+                "liveEditWrite"   => await HandleLiveEditWrite(args),
+                "setLiveSource"   => HandleSetLiveSource(args),
+                "getLiveStatus"   => GetLiveStatus(),
+                _                 => throw new InvalidOperationException($"Unknown bridge type: {type}"),
             };
 
             await Resolve(id, result);
@@ -107,6 +142,42 @@ public sealed class NativeBridge : IDisposable
                 dataBase64= Convert.ToBase64String(bytes),
             };
         }).Task;
+    }
+
+    private object HandleOpenTexturePack()
+    {
+        return _dispatcher.Invoke<object>(() =>
+        {
+            var dlg = new OpenFileDialog
+            {
+                Filter = "Texture Pack|*.perm.bin|All Files|*.*",
+                Title  = "Open Texture Pack — select the .perm.bin file",
+                InitialDirectory = _lastOpenedPath != null
+                    ? Path.GetDirectoryName(_lastOpenedPath) : null,
+            };
+
+            if (dlg.ShowDialog(MainWin) != true)
+                return (object)new { cancelled = true };
+
+            _lastOpenedPath  = dlg.FileName;
+            _packDirectory   = Path.GetDirectoryName(dlg.FileName)!;
+
+            var dir      = _packDirectory;
+            var fileName = Path.GetFileName(dlg.FileName);   // "foo.perm.bin"
+            var baseName = fileName[..^9];                    // "foo"
+
+            var tempName = baseName + ".temp.bin";
+            var idxName  = baseName + ".perm.idx";
+
+            return new
+            {
+                cancelled = false,
+                host      = "localpack.invalid",
+                permName  = fileName,
+                tempName  = File.Exists(Path.Combine(dir, tempName)) ? tempName : (string?)null,
+                idxName   = File.Exists(Path.Combine(dir, idxName))  ? idxName  : (string?)null,
+            };
+        });
     }
 
     private async Task<object> HandleSaveFile(JsonElement args)
@@ -265,5 +336,9 @@ public sealed class NativeBridge : IDisposable
             $"window.__nativeBridge?.reject({JsonSerializer.Serialize(id)},{JsonSerializer.Serialize(message)});");
     }
 
-    public void Dispose() => _liveEdit.Dispose();
+    public void Dispose()
+    {
+        _wv.WebResourceRequested -= OnPackFileRequested;
+        _liveEdit.Dispose();
+    }
 }

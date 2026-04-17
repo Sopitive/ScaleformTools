@@ -51,10 +51,13 @@ export interface TextureEntry {
   depth: number;
   flags: number;
   alphaUID: number;
-  /** Byte size of pixel data in temp.bin. */
+  /** Byte size of pixel data. */
   dataSize: number;
-  /** Byte offset of pixel data in temp.bin. */
+  /** Byte offset of pixel data within temp.bin (streaming packs). */
   dataPos: bigint;
+  /** Absolute byte offset of pixel data within perm.bin (embedded/idx packs).
+   *  = dataBase + Number(dataPos).  Use this when tempBytes is unavailable. */
+  permDataOffset: number;
   /** Raw pixel bytes (no DDS header) — populated by loadPixels(). */
   pixels?: Uint8Array;
 }
@@ -103,10 +106,15 @@ export function parsePerm(permBytes: Uint8Array): TextureEntry[] {
     const relOffset  = readU32(view, offset + 12);
 
     const totalSize = entrySz0 + RESOURCE_ENTRY_SIZE;
-    if (totalSize < RESOURCE_ENTRY_SIZE || totalSize > permBytes.length) break;
+    if (totalSize < RESOURCE_ENTRY_SIZE) break;
 
     if (typeUID === TEXTURE_TYPE_UID && entrySz0 > 0) {
-      const dataBase = offset + (relOffset || 0);
+      // entryStart: the beginning of this ResourceEntry_t (includes the 16-byte header).
+      // dataBase: where ResourceData_t fields (name, format, dataPos, …) are read from.
+      // relOffset may be non-zero (e.g. when pixel data precedes the metadata within the
+      // same entry block), so keep entryStart separate from dataBase.
+      const entryStart = offset;
+      const dataBase   = offset + (relOffset || 0);
 
       if (dataBase + OFF_IMAGE_DATA_POSITION + 8 <= permBytes.length) {
         const name       = readCStr(permBytes, dataBase + OFF_DEBUG_NAME, 36);
@@ -118,14 +126,18 @@ export function parsePerm(permBytes: Uint8Array): TextureEntry[] {
         const numMipmaps = readU8 (view, dataBase + OFF_NUM_MIPMAPS);
         const depth      = readU16(view, dataBase + OFF_DEPTH);
         const alphaUID   = readU32(view, dataBase + OFF_ALPHA_STATE_UID);
-        const dataSize   = readU32(view, dataBase + OFF_IMAGE_DATA_BYTE_SIZE);
-        const dataPos    = readU64(view, dataBase + OFF_IMAGE_DATA_POSITION);
+        const dataSize       = readU32(view, dataBase + OFF_IMAGE_DATA_BYTE_SIZE);
+        const dataPos        = readU64(view, dataBase + OFF_IMAGE_DATA_POSITION);
+        // For embedded packs (idx / no temp.bin), pixel data lives at entryStart + dataPos
+        // within perm.bin (dataPos is relative to the *entry* start, not to dataBase).
+        // For streaming packs, dataPos is the absolute byte offset within temp.bin.
+        const permDataOffset = entryStart + Number(dataPos);
 
         if (width > 0 && height > 0 && dataSize > 0) {
           results.push({
             index, dataBase, name: name || `tex_${index}`,
             format, texType, width, height, numMipmaps,
-            depth, flags, alphaUID, dataSize, dataPos,
+            depth, flags, alphaUID, dataSize, dataPos, permDataOffset,
           });
           index++;
         }
@@ -138,13 +150,45 @@ export function parsePerm(permBytes: Uint8Array): TextureEntry[] {
   return results;
 }
 
-export function loadPixels(entry: TextureEntry, tempBytes: Uint8Array): Uint8Array {
-  const pos  = Number(entry.dataPos);
-  const size = entry.dataSize;
-  if (pos < 0 || pos + size > tempBytes.length) {
-    throw new Error(`Pixel data out of range: pos=0x${pos.toString(16)} size=0x${size.toString(16)}`);
+/**
+ * Extract raw pixel bytes for an entry.
+ * - streaming packs (temp.bin present): pass pixelBytes=tempBytes, embedded=false
+ * - embedded packs (idx / no temp.bin): pass pixelBytes=permBytes, embedded=true, idxOffset=absolute perm.bin pixel offset from parseIdx()
+ */
+export function loadPixels(entry: TextureEntry, pixelBytes: Uint8Array, embedded = false, idxOffset?: number): Uint8Array {
+  let pos: number;
+  if (embedded && idxOffset !== undefined) {
+    pos = idxOffset;
+  } else if (embedded) {
+    pos = entry.permDataOffset;
+  } else {
+    pos = Number(entry.dataPos);
   }
-  return tempBytes.slice(pos, pos + size);
+  const size = entry.dataSize;
+  if (pos < 0 || pos + size > pixelBytes.length) {
+    throw new Error(`Pixel data out of range: pos=0x${pos.toString(16)} size=0x${size.toString(16)} buf=0x${pixelBytes.length.toString(16)}`);
+  }
+  return pixelBytes.slice(pos, pos + size);
+}
+
+/**
+ * Parse a perm.idx file and return the absolute perm.bin pixel-data offsets per texture.
+ *
+ * Structure: 120-byte header, then N × 40-byte entries.
+ * Each entry's pixel offset is a uint32 LE at entry byte 12.
+ * Entry k corresponds to parsePerm() result[k] (same order).
+ */
+export function parseIdx(idxBytes: Uint8Array): number[] {
+  const view = new DataView(idxBytes.buffer, idxBytes.byteOffset, idxBytes.byteLength);
+  const TABLE_START = 120;
+  const ENTRY_SIZE = 40;
+  const OFFSET_WITHIN_ENTRY = 12;
+  const count = Math.floor((idxBytes.length - TABLE_START) / ENTRY_SIZE);
+  const offsets: number[] = [];
+  for (let i = 0; i < count; i++) {
+    offsets.push(view.getUint32(TABLE_START + i * ENTRY_SIZE + OFFSET_WITHIN_ENTRY, true));
+  }
+  return offsets;
 }
 
 // ─── DDS builder (mirrors Python make_dds) ───────────────────────────────────
