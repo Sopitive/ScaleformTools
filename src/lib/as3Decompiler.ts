@@ -757,9 +757,10 @@ function decompileClass(abc: ParsedABC, classIdx: number): string {
   const pkg       = pkgDot >= 0 ? className.slice(0, pkgDot) : '';
   const simpleName= pkgDot >= 0 ? className.slice(pkgDot + 1) : className;
   const superName = inst.superIdx ? shortName(abc, inst.superIdx) : '';
-  const isDynamic = !!(inst.flags & 0x04);
-  const isFinal   = !!(inst.flags & 0x02);
-  const isInterface = !!(inst.flags & 0x01);
+  const isSealed    = !!(inst.flags & 0x01);  // CLASS_SEALED
+  const isFinal     = !!(inst.flags & 0x02);  // CLASS_FINAL
+  const isInterface = !!(inst.flags & 0x04);  // CLASS_INTERFACE
+  const isDynamic   = !isSealed;              // dynamic = not sealed
 
   const lines: string[] = [];
   const I = (n = 1) => '    '.repeat(n);
@@ -782,10 +783,9 @@ function decompileClass(abc: ParsedABC, classIdx: number): string {
   lines.push('');
 
   const classMods: string[] = ['public'];
-  if (isDynamic)  classMods.push('dynamic');
-  if (isFinal)    classMods.push('final');
-  if (isInterface) classMods.push('interface');
-  else             classMods.push('class');
+  if (isDynamic && !isInterface) classMods.push('dynamic');
+  if (isFinal)                   classMods.push('final');
+  classMods.push(isInterface ? 'interface' : 'class');
 
   let classDecl = `${I()}${classMods.join(' ')} ${simpleName}`;
   if (superName && superName !== 'Object') classDecl += ` extends ${superName}`;

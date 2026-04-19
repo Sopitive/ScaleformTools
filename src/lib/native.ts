@@ -101,6 +101,15 @@ export interface LiveEditStatus {
 // ── File I/O ─────────────────────────────────────────────────────────────────
 
 /**
+ * Reads a file at an absolute path without showing a dialog.
+ * Used for silently loading dependency GFX files (e.g. widgetarray.gfx).
+ * Returns `{cancelled: true}` if the path doesn't exist or is not accessible.
+ */
+export function nativeReadFile(path: string): Promise<OpenFileResult> {
+  return call('readFile', { path });
+}
+
+/**
  * Opens an OpenFileDialog and returns the chosen file's bytes as base64.
  * Returns `{cancelled: true}` if the user dismisses the dialog.
  */

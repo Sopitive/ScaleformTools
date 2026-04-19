@@ -408,6 +408,25 @@ export class AVMRuntime {
     try { this.executeMethod(inst.iinit, target, [], [], entry.abcIdx); } catch (_) {}
   }
 
+  // ─── Broadcast an event to every registered display object ──────────────
+  // Used for ENTER_FRAME and ADDED_TO_STAGE which fire on all objects, not
+  // just a single named target.
+
+  dispatchGlobalEvent(eventName: string): DisplayChange[] {
+    this._pendingChanges = [];
+    const ev = this.makeEvent(eventName, this.stage);
+    for (const obj of this.displayObjects.values()) {
+      const listeners = obj.eventListeners.get(eventName) ?? [];
+      for (const fn of listeners) {
+        try { this.callClosure(fn, obj, [ev]); } catch (_) {}
+      }
+    }
+    const changes = [...this._pendingChanges];
+    this._pendingChanges = [];
+    this.onChanges?.(changes);
+    return changes;
+  }
+
   // ─── Event dispatch ───────────────────────────────────────────────────────
 
   dispatchEvent(targetName: string, eventName: string): DisplayChange[] {

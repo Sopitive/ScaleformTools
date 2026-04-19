@@ -25,7 +25,7 @@ import {
 import { Stage, Layer, Rect, Transformer, Text, Group, Path } from 'react-konva';
 import { motion, AnimatePresence } from 'framer-motion';
 
-import { GFXParser } from './lib/gfx';
+import { GFXParser, mergeDependencyLibrary } from './lib/gfx';
 import { parseAS2Actions, encodeAS2Actions } from './lib/gfxPatcher';
 import type { EditableAction } from './lib/gfxPatcher';
 import { parseAS3 } from './lib/as3Parser';
@@ -37,6 +37,7 @@ import { AVMRuntime, type DisplayChange } from './lib/as3Runtime';
 import {
   isNative,
   nativeOpenFile,
+  nativeReadFile,
   nativeSaveFile,
   nativeLiveEditWrite,
   onLiveEditStatus,
@@ -113,6 +114,16 @@ interface GFXElement {
   };
   // Shape's local coordinate bounding box (for gradient positioning)
   shapeLocalBounds?: { x: number; y: number; w: number; h: number };
+  // Filter effects
+  filterBlur?: number;
+  filterGlow?: string;
+  filterGlowBlur?: number;
+  // Morph shape interpolation
+  morphStartPath?: string;
+  morphEndPath?: string;
+  morphStartFill?: string;
+  morphEndFill?: string;
+  morphRatio?: number;
   // Internal: binary patch location, set by parser - do not edit manually
   _patchKey?: string;
   _origX?: number;
@@ -125,6 +136,9 @@ interface GFXElement {
   // Which sprite directly contains this element, and how many frames that sprite has
   _spriteId?: number;
   _spriteFrameCount?: number;
+  // Mask / clip group — set when element is a SWF clip mask or is masked by one
+  _clipGroupId?: string;
+  _isMask?: boolean;
 }
 
 const App: React.FC = () => {
@@ -180,11 +194,20 @@ const App: React.FC = () => {
   const [hoverSimulation, setHoverSimulation] = useState(false);
   const [appMode, setAppMode] = useState<'gfx' | 'textures'>('gfx');
   const [scriptEditorTarget, setScriptEditorTarget] = useState<any>(null);
+  const [showKeyframes, setShowKeyframes] = useState(false);
+  const [keyframeHeight, setKeyframeHeight] = useState(180);
+  const keyframeDragRef = useRef<{ startY: number; startH: number } | null>(null);
   // Ref: per-sprite current frame for composite playback (avoids stale closure)
   const spriteFramesRef = useRef<Map<number, number>>(new Map());
   const currentFrameRef = useRef(0);
   // Track which sprite is currently in a hover state (so leave knows what to revert)
   const hoveredSpritesRef = useRef<Map<number, string>>(new Map()); // spriteId → label entered
+  // Absolute path of the currently-open GFX file (for dependency resolution)
+  const openedFilePathRef = useRef<string | null>(null);
+  // User visibility overrides: element name → false (hidden). Persists across animation frames.
+  const visibilityOverridesRef = useRef<Map<string, boolean>>(new Map());
+  // User transform overrides: element name → {x,y,scaleX,scaleY}. Persists across animation frames.
+  const transformOverridesRef = useRef<Map<string, Partial<GFXElement>>>(new Map());
 
   const pushHistory = (newElements: GFXElement[]) => {
     const newHistory = history.slice(0, historyIndex + 1);
@@ -208,7 +231,7 @@ const App: React.FC = () => {
     }
   };
 
-  const processFileBuffer = async (buffer: ArrayBuffer, name: string) => {
+  const processFileBuffer = async (buffer: ArrayBuffer, name: string, filePath?: string) => {
     suppressLiveSaveRef.current = true;
     try {
       const parser = new GFXParser(buffer);
@@ -216,15 +239,107 @@ const App: React.FC = () => {
       console.log('Parsed GFX:', modernFormat);
       parserRef.current = parser;
 
+      // Store the opened file path for dependency resolution
+      openedFilePathRef.current = filePath ?? null;
+      // Reset overrides for the new file
+      visibilityOverridesRef.current = new Map();
+      transformOverridesRef.current = new Map();
+
       getElementsRef.current = modernFormat.getElementsForFrame;
       setHistory([modernFormat.elements]);
       setHistoryIndex(0);
       setElements(modernFormat.elements);
+      setSelectedIds([]);  // clear old selection so the panel doesn't reference stale element IDs
       setCurrentScripts(modernFormat.scripts || []);
       const allScriptsNow = modernFormat.allScripts || [];
       setAllScripts(allScriptsNow);
       setFileName(name);
       setGfxMeta(modernFormat.gfxMeta);
+
+      // ── Auto-load dependency GFX files (ImportAssets resolution) ──────────
+      const deps: string[] = modernFormat.gfxMeta?.dependencies ?? [];
+      if (deps.length > 0 && filePath && isNative) {
+        const fileDir = filePath.includes('\\')
+          ? filePath.substring(0, filePath.lastIndexOf('\\'))
+          : filePath.substring(0, filePath.lastIndexOf('/'));
+
+        const loadedDepNames = new Set<string>(); // prevent loading the same file twice
+
+        const tryLoadDepUrl = async (depUrl: string, extraDirs: string[] = []): Promise<void> => {
+          const depFile = depUrl.split('/').pop()!.split('\\').pop()!;
+          const baseName = depFile.replace(/\.(swf|gfx)$/i, '');
+          const canonical = baseName.toLowerCase();
+          if (loadedDepNames.has(canonical)) return;
+          loadedDepNames.add(canonical);
+
+          // Build the directory from the stored absolute path (if it looks like one)
+          const storedDir = (depUrl.includes('\\') || depUrl.includes('/'))
+            ? depUrl.substring(0, Math.max(depUrl.lastIndexOf('\\'), depUrl.lastIndexOf('/')))
+            : '';
+
+          // Candidate paths: same dir as opened file → stored dir → extra dirs, each with .gfx / .swf
+          const searchDirs = [fileDir, storedDir, ...extraDirs].filter(Boolean);
+          const candidates: string[] = [];
+          for (const dir of searchDirs) {
+            candidates.push(dir + '\\' + baseName + '.gfx');
+            candidates.push(dir + '\\' + baseName + '.swf');
+            candidates.push(dir + '\\' + depFile);
+          }
+          // Also try the dep URL verbatim and with .gfx substituted
+          candidates.push(depUrl, depUrl.replace(/\.(swf|gfx)$/i, '.gfx'));
+
+          const uniqueCandidates = [...new Set(candidates)];
+          console.log('[Deps] Searching for', baseName, '— candidates:', uniqueCandidates);
+          for (const candidate of uniqueCandidates) {
+            try {
+              const result = await nativeReadFile(candidate);
+              if (!result.cancelled && result.dataBase64) {
+                console.log('[Deps] ✓ Loaded:', candidate);
+                const depBytes = base64ToUint8(result.dataBase64);
+                const depParser = new GFXParser(depBytes.buffer as ArrayBuffer);
+                const depFormat = await depParser.toModernFormat();
+                const beforeCount = Object.keys(modernFormat.library).length;
+                mergeDependencyLibrary(modernFormat.library, depFormat.library);
+                const afterCount = Object.keys(modernFormat.library).length;
+                console.log('[Deps] Merged', baseName, `(+${afterCount - beforeCount} new chars, total ${afterCount})`);
+                // Log any still-unresolved imports from this dep file
+                const stillMissing = Object.values(depFormat.library).filter((e: any) => e?._imported).map((e: any) => e.className);
+                if (stillMissing.length) console.warn('[Deps]', baseName, 'has unresolved imports:', stillMissing);
+                // Recursively load this dep's own dependencies
+                for (const nestedUrl of depFormat.gfxMeta?.dependencies ?? []) {
+                  await tryLoadDepUrl(nestedUrl, searchDirs);
+                }
+                return;
+              }
+            } catch (err) { console.warn('[Deps] Error trying', candidate, err); }
+          }
+          console.warn('[Deps] ✗ Not found:', baseName, '\n  Tried:\n ', uniqueCandidates.join('\n  '));
+        };
+
+        for (const depUrl of deps) {
+          await tryLoadDepUrl(depUrl);
+        }
+
+        // Final diagnostic: show any imported placeholders still unresolved
+        const unresolved = Object.values(modernFormat.library)
+          .filter((e: any) => e?._imported)
+          .map((e: any) => `id=${e.id} "${e.className}" from ${e._importUrl?.split('\\').pop() ?? '?'}`);
+        if (unresolved.length) {
+          console.warn('[Deps] Still unresolved after all deps loaded:', unresolved);
+        } else {
+          console.log('[Deps] All imports resolved ✓');
+        }
+        console.log('[Deps] Final library size:', Object.keys(modernFormat.library).length, 'entries');
+
+        // Re-render frame 0 with the now-merged library so red boxes resolve immediately
+        // (the initial setElements(modernFormat.elements) above ran before deps were loaded)
+        if (getElementsRef.current) {
+          const { elements: fe, scripts: sc } = getElementsRef.current(0, 0);
+          setElements(applyOverrides(fe));
+          setCurrentScripts(sc);
+        }
+      }
+
       setLibrary(modernFormat.library);
       setCurrentFrame(0);
       setCurrentFrameCount(modernFormat.gfxMeta?.frameCount || 1);
@@ -242,9 +357,26 @@ const App: React.FC = () => {
         rt.runScriptInits();
         // Wire change callback to update canvas elements via setElements
         rt.onChanges = (changes: DisplayChange[]) => {
+          // Handle currentFrame jumps (gotoAndStop / gotoAndPlay) by updating the
+          // sprite frame map so the animation loop renders the correct frame next tick.
+          const frameJumps = changes.filter(ch => ch.prop === 'currentFrame');
+          if (frameJumps.length > 0) {
+            const next = new Map(spriteFramesRef.current);
+            for (const ch of frameJumps) {
+              // Find the sprite whose instance name matches the changed object
+              for (const [idStr, def] of Object.entries(library)) {
+                if ((def as any).className === ch.objName || (def as any)._name === ch.objName) {
+                  next.set(parseInt(idStr), Math.max(0, Number(ch.value) - 1)); // 1-based → 0-based
+                  break;
+                }
+              }
+            }
+            spriteFramesRef.current = next;
+          }
           setElements(prev => {
             let next = prev;
             for (const ch of changes) {
+              if (ch.prop === 'currentFrame') continue; // handled above
               const idx = next.findIndex(e => e.name === ch.objName);
               if (idx === -1) continue;
               next = next.map((e, i) => {
@@ -262,13 +394,19 @@ const App: React.FC = () => {
             return next;
           });
         };
+        // Dispatch addedToStage so scripts that register ENTER_FRAME listeners
+        // inside their addedToStage handler get a chance to do so before playback.
+        rt.dispatchGlobalEvent('addedToStage');
         avmRtRef.current = rt;
       } catch (e) {
         console.warn('AVM runtime init failed:', e);
       }
       setCurrentContext(0);
       setNavigationStack([]);
-      setIsPlaying(false);
+      // Auto-start playback with composite mode so all sprites animate independently.
+      setCompositeMode(true);
+      setIsPlaying(true);
+      spriteFramesRef.current = new Map(); // reset per-sprite frame counters on new file
 
       const sw = modernFormat.gfxMeta?.stageW || 1920;
       const sh = modernFormat.gfxMeta?.stageH || 1080;
@@ -313,7 +451,7 @@ const App: React.FC = () => {
       const result = await nativeOpenFile();
       if (result.cancelled || !result.dataBase64 || !result.name) return;
       const bytes = base64ToUint8(result.dataBase64);
-      await processFileBuffer(bytes.buffer as ArrayBuffer, result.name);
+      await processFileBuffer(bytes.buffer as ArrayBuffer, result.name, result.path);
       // Remember the path so Live Mode can write back to the same file
       if (result.path) {
         nativeLiveSourceRef.current = result.path;
@@ -472,7 +610,53 @@ const App: React.FC = () => {
   const handleElementChange = (idOrIds: string | string[], newAttrs: Partial<GFXElement>) => {
     const ids = Array.isArray(idOrIds) ? idOrIds : [idOrIds];
     const newElements = elements.map(el => ids.includes(el.id) ? { ...el, ...newAttrs } : el);
+    // Persist visibility overrides so animation frames don't un-hide manually-hidden elements
+    if (newAttrs.visible !== undefined) {
+      for (const id of ids) {
+        const el = elements.find(e => e.id === id);
+        if (!el) continue;
+        if (newAttrs.visible === false) {
+          visibilityOverridesRef.current.set(el.name, false);
+        } else {
+          visibilityOverridesRef.current.delete(el.name);
+        }
+      }
+    }
+    // Persist transform overrides so animation frames don't snap moved elements back
+    const transformKeys = ['x', 'y', 'scaleX', 'scaleY', 'rotate0', 'rotate1'] as const;
+    const hasTransform = transformKeys.some(k => k in newAttrs);
+    if (hasTransform) {
+      for (const id of ids) {
+        const el = elements.find(e => e.id === id);
+        if (!el) continue;
+        const existing = transformOverridesRef.current.get(el.name) ?? {};
+        const update: Partial<GFXElement> = { ...existing };
+        for (const k of transformKeys) {
+          if (k in newAttrs) (update as any)[k] = (newAttrs as any)[k];
+        }
+        transformOverridesRef.current.set(el.name, update);
+      }
+    }
     pushHistory(newElements);
+  };
+
+  /** Apply user visibility and transform overrides to a freshly-generated element list. */
+  const applyOverrides = (els: GFXElement[]): GFXElement[] => {
+    const hasVis = visibilityOverridesRef.current.size > 0;
+    const hasTx  = transformOverridesRef.current.size > 0;
+    if (!hasVis && !hasTx) return els;
+    return els.map(el => {
+      let next = el;
+      if (hasVis) {
+        const visOverride = visibilityOverridesRef.current.get(el.name);
+        if (visOverride === false) next = { ...next, visible: false };
+      }
+      if (hasTx) {
+        const txOverride = transformOverridesRef.current.get(el.name);
+        if (txOverride) next = { ...next, ...txOverride };
+      }
+      return next;
+    });
   };
 
   const handleDragMove = (id: string, e: any) => {
@@ -513,6 +697,13 @@ const App: React.FC = () => {
       }
       return el;
     });
+    // Record transform overrides for each moved element so animation won't snap them back
+    for (const el of newElements) {
+      if (selectedIds.includes(el.id)) {
+        const existing = transformOverridesRef.current.get(el.name) ?? {};
+        transformOverridesRef.current.set(el.name, { ...existing, x: el.x, y: el.y });
+      }
+    }
     pushHistory(newElements);
   };
 
@@ -541,15 +732,38 @@ const App: React.FC = () => {
     return false;
   };
 
+  // Build the initial sprite frame map covering all multi-frame sprites in the library
+  const buildSpriteFrameMap = () => {
+    const map = new Map<number, number>();
+    for (const [idStr, def] of Object.entries(library)) {
+      if ((def as any).type === 'sprite' && (def as any).frameCount > 1) map.set(parseInt(idStr), 0);
+    }
+    return map;
+  };
+
   // --- Animation Playback Engine ---
   useEffect(() => {
     const hasRootAnim = currentFrameCount > 1;
-    const hasSpriteAnim = compositeMode && spriteFramesRef.current.size > 0;
+    // Auto-animate sprites when: composite mode OR root is single-frame (sprites must drive themselves)
+    const needsSpriteAnim = compositeMode || currentFrameCount <= 1;
+
+    // Ensure sprite map is populated whenever we need sprite animation
+    if (needsSpriteAnim && spriteFramesRef.current.size === 0) {
+      spriteFramesRef.current = buildSpriteFrameMap();
+    }
+
+    const hasSpriteAnim = needsSpriteAnim && spriteFramesRef.current.size > 0;
     if (!isPlaying || (!hasRootAnim && !hasSpriteAnim)) return;
 
     const fps = (gfxMeta?.frameRate || 30) * playbackSpeed;
     const interval = setInterval(() => {
-      // 1. Advance sprite frames (composite mode)
+      // 0. Fire ENTER_FRAME on all AS3 display objects that have registered listeners.
+      //    This drives Tween classes, custom animation loops, and state machines.
+      if (avmRtRef.current) {
+        avmRtRef.current.dispatchGlobalEvent('enterFrame');
+      }
+
+      // 1. Advance all tracked sprite frames independently
       if (hasSpriteAnim) {
         const next = new Map(spriteFramesRef.current);
         for (const [spriteId, frame] of next.entries()) {
@@ -562,7 +776,7 @@ const App: React.FC = () => {
         spriteFramesRef.current = next;
       }
 
-      // 2. Advance root frame
+      // 2. Advance root frame (multi-frame roots only)
       if (hasRootAnim) {
         setCurrentFrame(prev => {
           const next = prev + 1;
@@ -571,19 +785,20 @@ const App: React.FC = () => {
           const nextFrame = looped ? 0 : next;
           if (getElementsRef.current) {
             const { elements: fe, scripts: sc } = getElementsRef.current(nextFrame, currentContext, hasSpriteAnim ? new Map(spriteFramesRef.current) : undefined);
-            setElements(fe); setCurrentScripts(sc);
+            setElements(applyOverrides(fe)); setCurrentScripts(sc);
           }
           return nextFrame;
         });
       } else {
-        // Sprite-only — re-render with same root frame
+        // Sprite-only (single-frame root) — re-render using the sprite frame map
         if (getElementsRef.current) {
           const { elements: fe, scripts: sc } = getElementsRef.current(currentFrameRef.current, currentContext, new Map(spriteFramesRef.current));
-          setElements(fe); setCurrentScripts(sc);
+          setElements(applyOverrides(fe)); setCurrentScripts(sc);
         }
       }
     }, 1000 / fps);
     return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPlaying, currentFrameCount, currentContext, gfxMeta, isLooping, playbackSpeed, compositeMode, library]);
 
   // Precompute which frames have scripts so the script map strip can display them all at once
@@ -600,8 +815,9 @@ const App: React.FC = () => {
   const handleFrameChange = (frame: number) => {
     if (!getElementsRef.current) return;
     setCurrentFrame(frame);
-    const { elements: newElements, scripts } = getElementsRef.current(frame, currentContext, compositeMode ? new Map(spriteFramesRef.current) : undefined);
-    setElements(newElements);
+    const sprMap = spriteFramesRef.current.size > 0 ? new Map(spriteFramesRef.current) : undefined;
+    const { elements: newElements, scripts } = getElementsRef.current(frame, currentContext, sprMap);
+    setElements(applyOverrides(newElements));
     setCurrentScripts(scripts);
   };
 
@@ -610,7 +826,7 @@ const App: React.FC = () => {
     spriteFramesRef.current = new Map(spriteFramesRef.current).set(spriteId, frame);
     if (getElementsRef.current) {
       const { elements: fe, scripts: sc } = getElementsRef.current(currentFrameRef.current, currentContext, new Map(spriteFramesRef.current));
-      setElements(fe); setCurrentScripts(sc);
+      setElements(applyOverrides(fe)); setCurrentScripts(sc);
     }
   };
 
@@ -687,11 +903,8 @@ const App: React.FC = () => {
 
   // ── Entry animation preview ───────────────────────────────────────────────
   const previewEntry = () => {
-    // Reset all sprites to frame 0, enable composite + play
-    const map = new Map<number, number>();
-    for (const [idStr, def] of Object.entries(library)) {
-      if ((def as any).type === 'sprite') map.set(parseInt(idStr), 0);
-    }
+    // Reset all multi-frame sprites to frame 0, enable composite + play
+    const map = buildSpriteFrameMap();
     spriteFramesRef.current = map;
     setCompositeMode(true);
     setIsPlaying(true);
@@ -699,7 +912,7 @@ const App: React.FC = () => {
     setCurrentFrame(0);
     if (getElementsRef.current) {
       const { elements: fe, scripts: sc } = getElementsRef.current(0, currentContext, map);
-      setElements(fe); setCurrentScripts(sc);
+      setElements(applyOverrides(fe)); setCurrentScripts(sc);
     }
   };
 
@@ -851,6 +1064,10 @@ const App: React.FC = () => {
         const dy = e.clientY - panStartRef.current.py;
         setPanOffset({ x: panStartRef.current.ox + dx, y: panStartRef.current.oy + dy });
       }
+      if (keyframeDragRef.current) {
+        const dy = e.clientY - keyframeDragRef.current.startY;
+        setKeyframeHeight(Math.max(80, Math.min(400, keyframeDragRef.current.startH - dy)));
+      }
     };
     const onGlobalMouseUp = () => {
       if (isPanningRef.current) {
@@ -861,6 +1078,7 @@ const App: React.FC = () => {
         hasDraggedRef.current = false;
         setSelectionBox(null);
       }
+      keyframeDragRef.current = null;
     };
     window.addEventListener('mousemove', onGlobalMouseMove);
     window.addEventListener('mouseup', onGlobalMouseUp);
@@ -921,7 +1139,9 @@ const App: React.FC = () => {
       )}
 
       {/* GFX / SWF editor layout */}
-      <div style={{ display: appMode === 'gfx' ? 'flex' : 'none', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+      <div style={{ display: appMode === 'gfx' ? 'flex' : 'none', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+      {/* Main editing row: sidebars + canvas */}
+      <div style={{ display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }}>
       {/* Left Sidebar: Layers / Library / Scripts */}
       <aside className="sidebar">
         <div style={{ height: '44px', flexShrink: 0, padding: '0 0.75rem', borderBottom: '1px solid var(--border-color)', display: 'flex', gap: '4px', alignItems: 'center' }}>
@@ -1391,25 +1611,75 @@ const App: React.FC = () => {
                 }}
               >
                 <Layer>
-                  {elements.map((el) => (
-                    <RenderElement
-                      key={el.id}
-                      element={el}
-                      onSelect={(e) => handleSelect(el.id, e.evt.shiftKey || e.evt.ctrlKey || e.evt.metaKey)}
-                      onChange={(newAttrs) => handleElementChange(el.id, newAttrs)}
-                      onDragMove={(e) => handleDragMove(el.id, e)}
-                      onDragEnd={(e) => handleDragEnd(el.id, e)}
-                      onHoverEnter={hoverSimulation ? () => handleElementHover(el) : undefined}
-                      onHoverLeave={hoverSimulation ? () => handleElementLeave(el) : undefined}
-                      onElementClick={hoverSimulation ? () => {
-                        if (avmRtRef.current && el.name) avmRtRef.current.dispatchEvent(el.name, 'click');
-                      } : undefined}
-                      isInteractive={hoverSimulation && (
-                        ((el._spriteFrameCount ?? 1) > 1 && !!library[el._spriteId ?? 0]?.frameLabels?.some((l: any) => LABEL_CATS.hover.some(n => l.label.toLowerCase().startsWith(n))))
-                        || !!(avmRtRef.current?.getOrCreateDisplayObject(el.name)?.eventListeners?.size)
-                      )}
-                    />
-                  ))}
+                  {(() => {
+                    // Group elements by clip group, preserving render order
+                    type ClipGroup = { maskEl: GFXElement | null; maskedEls: GFXElement[] };
+                    const clipGroups = new Map<string, ClipGroup>();
+                    const renderOrder: Array<GFXElement | string> = []; // element id or clipGroupId
+
+                    for (const el of elements) {
+                      if (el._clipGroupId) {
+                        if (!clipGroups.has(el._clipGroupId)) {
+                          clipGroups.set(el._clipGroupId, { maskEl: null, maskedEls: [] });
+                          renderOrder.push(el._clipGroupId);
+                        }
+                        const g = clipGroups.get(el._clipGroupId)!;
+                        if (el._isMask) g.maskEl = el;
+                        else g.maskedEls.push(el);
+                      } else {
+                        renderOrder.push(el);
+                      }
+                    }
+
+                    const makeRenderEl = (el: GFXElement) => (
+                      <RenderElement
+                        key={el.id}
+                        element={el}
+                        onSelect={(e) => handleSelect(el.id, e.evt.shiftKey || e.evt.ctrlKey || e.evt.metaKey)}
+                        onChange={(newAttrs) => handleElementChange(el.id, newAttrs)}
+                        onDragMove={(e) => handleDragMove(el.id, e)}
+                        onDragEnd={(e) => handleDragEnd(el.id, e)}
+                        onHoverEnter={hoverSimulation ? () => handleElementHover(el) : undefined}
+                        onHoverLeave={hoverSimulation ? () => handleElementLeave(el) : undefined}
+                        onElementClick={hoverSimulation ? () => {
+                          if (avmRtRef.current && el.name) avmRtRef.current.dispatchEvent(el.name, 'click');
+                        } : undefined}
+                        isInteractive={hoverSimulation && (
+                          ((el._spriteFrameCount ?? 1) > 1 && !!library[el._spriteId ?? 0]?.frameLabels?.some((l: any) => LABEL_CATS.hover.some(n => l.label.toLowerCase().startsWith(n))))
+                          || !!(avmRtRef.current?.getOrCreateDisplayObject(el.name)?.eventListeners?.size)
+                        )}
+                      />
+                    );
+
+                    return renderOrder.map(item => {
+                      if (typeof item !== 'string') return makeRenderEl(item);
+                      const g = clipGroups.get(item)!;
+                      const maskEl = g.maskEl;
+                      if (!maskEl) return g.maskedEls.map(makeRenderEl);
+                      // Render masked group: use mask shape as clipFunc
+                      const clipPath = maskEl.svgPath ?? null;
+                      return (
+                        <Group
+                          key={item}
+                          clipFunc={clipPath ? (ctx: any) => {
+                            const p = new Path2D(clipPath);
+                            ctx.save();
+                            ctx.translate(maskEl.x, maskEl.y);
+                            ctx.scale(maskEl.scaleX ?? 1, maskEl.scaleY ?? 1);
+                            ctx.beginPath();
+                            try { ctx.clip(p); } catch { ctx.rect(maskEl.x, maskEl.y, maskEl.width, maskEl.height); ctx.clip(); }
+                            ctx.restore();
+                          } : undefined}
+                          clipX={!clipPath ? maskEl.x : undefined}
+                          clipY={!clipPath ? maskEl.y : undefined}
+                          clipWidth={!clipPath ? maskEl.width : undefined}
+                          clipHeight={!clipPath ? maskEl.height : undefined}
+                        >
+                          {g.maskedEls.map(makeRenderEl)}
+                        </Group>
+                      );
+                    });
+                  })()}
                   {selectedIds.length > 0 && <Transformer ref={trRef} boundBoxFunc={(oldBox, newBox) => {
                     if (newBox.width < 5 || newBox.height < 5) return oldBox;
                     return newBox;
@@ -1525,11 +1795,7 @@ const App: React.FC = () => {
                       onClick={() => {
                         setCompositeMode(c => !c);
                         if (!compositeMode) {
-                          const map = new Map<number, number>();
-                          for (const [idStr, def] of Object.entries(library)) {
-                            if ((def as any).type === 'sprite' && (def as any).frameCount > 1) map.set(parseInt(idStr), 0);
-                          }
-                          spriteFramesRef.current = map;
+                          spriteFramesRef.current = buildSpriteFrameMap();
                         }
                       }}
                       title="Composite mode: animate all sprites simultaneously"
@@ -1555,6 +1821,16 @@ const App: React.FC = () => {
                       title="Reset all sprites to frame 0 and play entry animations"
                     >
                       ⟳ ENTRY
+                    </button>
+
+                    {/* Keyframe editor toggle */}
+                    <button
+                      className={`btn btn-secondary ${showKeyframes ? 'btn-primary' : ''}`}
+                      style={{ padding: '5px 8px', fontSize: '0.65rem', fontWeight: 700, opacity: showKeyframes ? 1 : 0.6 }}
+                      onClick={() => setShowKeyframes(k => !k)}
+                      title="Toggle sprite keyframe timeline"
+                    >
+                      ▤ KF
                     </button>
 
                     {/* Speed control */}
@@ -1781,7 +2057,6 @@ const App: React.FC = () => {
               {(() => {
                 const el = elements.find(e => e.id === selectedIds[0]);
                 const objOpacity = el?.opacity ?? 1;
-                // Detect fill-color alpha (e.g. rgba(r,g,b,0.5))
                 const fillAlpha = (() => {
                   const f = el?.fill;
                   if (!f) return null;
@@ -1807,12 +2082,224 @@ const App: React.FC = () => {
                     {hasAlphaFill && (
                       <div style={{ marginTop: '6px', fontSize: '0.65rem', color: '#fb923c', display: 'flex', alignItems: 'center', gap: '4px' }}>
                         <span>⚠</span>
-                        <span>Fill color alpha: {Math.round(fillAlpha! * 100)}% — shape appears {Math.round(objOpacity * fillAlpha! * 100)}% opaque total</span>
+                        <span>Fill alpha: {Math.round(fillAlpha! * 100)}% — {Math.round(objOpacity * fillAlpha! * 100)}% total</span>
                       </div>
                     )}
                   </div>
                 );
               })()}
+
+              {/* ── Morph Ratio ─────────────────────────────────────────── */}
+              {selectedIds.length === 1 && elements.find(e => e.id === selectedIds[0])?.morphStartPath != null && (() => {
+                const el = elements.find(e => e.id === selectedIds[0])!;
+                return (
+                  <div style={{ marginBottom: '1.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+                      <label style={{ fontSize: '0.75rem', color: '#fb923c', fontWeight: 600 }}>⟷ Morph Ratio</label>
+                      <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', fontFamily: 'monospace' }}>{((el.morphRatio ?? 0) * 100).toFixed(0)}%</span>
+                    </div>
+                    <input
+                      type="range" min="0" max="1" step="0.01"
+                      value={el.morphRatio ?? 0}
+                      onChange={(e) => handleElementChange(selectedIds, { morphRatio: parseFloat(e.target.value) })}
+                      style={{ width: '100%' }}
+                    />
+                    <div style={{ fontSize: '0.6rem', color: 'var(--text-secondary)', marginTop: '4px' }}>
+                      0 = start shape · 1 = end shape
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* ── Gradient Stop Editor ───────────────────────────────── */}
+              {selectedIds.length === 1 && elements.find(e => e.id === selectedIds[0])?.gradientFill && (() => {
+                const el = elements.find(e => e.id === selectedIds[0])!;
+                const gf = el.gradientFill!;
+                const toHex = (r: number, g: number, b: number) =>
+                  '#' + [r,g,b].map(v => v.toString(16).padStart(2,'0')).join('');
+                return (
+                  <div style={{ marginBottom: '1.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+                      <label style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                        <Palette size={12} style={{ display:'inline', marginRight:'4px' }} />
+                        Gradient ({gf.type})
+                      </label>
+                      <button
+                        style={{ fontSize: '0.6rem', padding: '1px 6px', background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', borderRadius: '3px', cursor: 'pointer' }}
+                        onClick={() => handleElementChange(selectedIds, { gradientFill: { ...gf, type: gf.type === 'linear' ? 'radial' : 'linear' } })}
+                      >
+                        {gf.type === 'linear' ? '→ Radial' : '→ Linear'}
+                      </button>
+                    </div>
+                    {gf.stops.map((stop, si) => (
+                      <div key={si} style={{ display: 'grid', gridTemplateColumns: '28px 1fr 48px 20px', gap: '6px', alignItems: 'center', marginBottom: '6px' }}>
+                        <input
+                          type="color"
+                          value={toHex(stop.r, stop.g, stop.b)}
+                          onChange={(ev) => {
+                            const hex = ev.target.value;
+                            const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+                            const newStops = gf.stops.map((s,i) => i === si ? {...s,r,g,b} : s);
+                            handleElementChange(selectedIds, { gradientFill: {...gf, stops: newStops} });
+                          }}
+                          style={{ width: '28px', height: '24px', padding: 0, border: 'none', background: 'none', cursor: 'pointer' }}
+                        />
+                        <input
+                          type="range" min="0" max="1" step="0.01"
+                          value={stop.offset}
+                          onChange={(ev) => {
+                            const newStops = gf.stops.map((s,i) => i === si ? {...s, offset: parseFloat(ev.target.value)} : s);
+                            handleElementChange(selectedIds, { gradientFill: {...gf, stops: newStops} });
+                          }}
+                          style={{ height: '4px' }}
+                        />
+                        <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)', textAlign: 'right', fontFamily: 'monospace' }}>{(stop.offset*100).toFixed(0)}%</span>
+                        <button
+                          onClick={() => {
+                            if (gf.stops.length <= 2) return;
+                            handleElementChange(selectedIds, { gradientFill: {...gf, stops: gf.stops.filter((_,i)=>i!==si)} });
+                          }}
+                          style={{ fontSize: '0.6rem', background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', padding: 0 }}
+                          title="Remove stop"
+                        >✕</button>
+                      </div>
+                    ))}
+                    <button
+                      style={{ fontSize: '0.65rem', width: '100%', padding: '4px', background: 'var(--bg-tertiary)', border: '1px dashed var(--border-color)', color: 'var(--text-secondary)', borderRadius: '4px', cursor: 'pointer' }}
+                      onClick={() => {
+                        const last = gf.stops[gf.stops.length-1];
+                        handleElementChange(selectedIds, { gradientFill: {...gf, stops: [...gf.stops, {...last, offset: Math.min(1, last.offset + 0.1)}]} });
+                      }}
+                    >+ Add Stop</button>
+                  </div>
+                );
+              })()}
+
+              {/* ── Shadow / Glow / Blur Editor ───────────────────────── */}
+              {selectedIds.length === 1 && (() => {
+                const el = elements.find(e => e.id === selectedIds[0]);
+                if (!el) return null;
+                const hasFx = el.shadowColor || el.filterGlow || el.filterBlur;
+                const toHex = (css: string | undefined): string => {
+                  if (!css) return '#000000';
+                  if (/^#[0-9a-fA-F]{6}$/.test(css)) return css;
+                  const m = css.match(/\d+/g);
+                  if (!m || m.length < 3) return '#000000';
+                  return '#' + [+m[0],+m[1],+m[2]].map(v => v.toString(16).padStart(2,'0')).join('');
+                };
+                return (
+                  <div style={{ marginBottom: '1.5rem' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+                      <label style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                        ✦ Effects
+                      </label>
+                      {!hasFx && (
+                        <button
+                          style={{ fontSize: '0.6rem', padding: '1px 6px', background: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', borderRadius: '3px', cursor: 'pointer' }}
+                          onClick={() => handleElementChange(selectedIds, { shadowColor: 'rgba(0,0,0,0.5)', shadowBlur: 8, shadowOffsetX: 2, shadowOffsetY: 2 })}
+                        >+ Drop Shadow</button>
+                      )}
+                    </div>
+                    {el.shadowColor && (
+                      <div style={{ background: 'var(--bg-tertiary)', padding: '8px', borderRadius: '6px', marginBottom: '6px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                          <span style={{ fontSize: '0.65rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Drop Shadow</span>
+                          <button onClick={() => handleElementChange(selectedIds, { shadowColor: undefined, shadowBlur: undefined, shadowOffsetX: undefined, shadowOffsetY: undefined })} style={{ fontSize: '0.6rem', background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer' }}>✕</button>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '28px 1fr', gap: '6px', alignItems: 'center', marginBottom: '4px' }}>
+                          <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>Color</span>
+                          <input type="color" value={toHex(el.shadowColor)}
+                            onChange={(ev) => handleElementChange(selectedIds, { shadowColor: ev.target.value })}
+                            style={{ width: '100%', height: '22px', padding: 0, border: 'none', background: 'none' }} />
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '38px 1fr 36px', gap: '6px', alignItems: 'center', marginBottom: '4px' }}>
+                          <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>Blur</span>
+                          <input type="range" min="0" max="40" step="1" value={el.shadowBlur ?? 4}
+                            onChange={(ev) => handleElementChange(selectedIds, { shadowBlur: parseFloat(ev.target.value) })}
+                            style={{ height: '4px' }} />
+                          <span style={{ fontSize: '0.6rem', fontFamily: 'monospace', textAlign: 'right' }}>{(el.shadowBlur ?? 4).toFixed(0)}</span>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '38px 1fr 36px', gap: '6px', alignItems: 'center', marginBottom: '4px' }}>
+                          <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>X</span>
+                          <input type="range" min="-20" max="20" step="1" value={el.shadowOffsetX ?? 0}
+                            onChange={(ev) => handleElementChange(selectedIds, { shadowOffsetX: parseFloat(ev.target.value) })}
+                            style={{ height: '4px' }} />
+                          <span style={{ fontSize: '0.6rem', fontFamily: 'monospace', textAlign: 'right' }}>{(el.shadowOffsetX ?? 0).toFixed(0)}</span>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '38px 1fr 36px', gap: '6px', alignItems: 'center' }}>
+                          <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>Y</span>
+                          <input type="range" min="-20" max="20" step="1" value={el.shadowOffsetY ?? 0}
+                            onChange={(ev) => handleElementChange(selectedIds, { shadowOffsetY: parseFloat(ev.target.value) })}
+                            style={{ height: '4px' }} />
+                          <span style={{ fontSize: '0.6rem', fontFamily: 'monospace', textAlign: 'right' }}>{(el.shadowOffsetY ?? 0).toFixed(0)}</span>
+                        </div>
+                      </div>
+                    )}
+                    {el.filterGlow && (
+                      <div style={{ background: 'var(--bg-tertiary)', padding: '8px', borderRadius: '6px', marginBottom: '6px' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                          <span style={{ fontSize: '0.65rem', fontWeight: 600, color: 'var(--text-secondary)' }}>Glow</span>
+                          <button onClick={() => handleElementChange(selectedIds, { filterGlow: undefined, filterGlowBlur: undefined })} style={{ fontSize: '0.6rem', background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer' }}>✕</button>
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '28px 1fr', gap: '6px', alignItems: 'center', marginBottom: '4px' }}>
+                          <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>Color</span>
+                          <input type="color" value={toHex(el.filterGlow)}
+                            onChange={(ev) => handleElementChange(selectedIds, { filterGlow: ev.target.value })}
+                            style={{ width: '100%', height: '22px', padding: 0, border: 'none', background: 'none' }} />
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '38px 1fr 36px', gap: '6px', alignItems: 'center' }}>
+                          <span style={{ fontSize: '0.6rem', color: 'var(--text-muted)' }}>Blur</span>
+                          <input type="range" min="0" max="60" step="1" value={el.filterGlowBlur ?? 8}
+                            onChange={(ev) => handleElementChange(selectedIds, { filterGlowBlur: parseFloat(ev.target.value) })}
+                            style={{ height: '4px' }} />
+                          <span style={{ fontSize: '0.6rem', fontFamily: 'monospace', textAlign: 'right' }}>{(el.filterGlowBlur ?? 8).toFixed(0)}</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* ── Batch visibility toggle (multi-select) ─────────────── */}
+              {selectedIds.length > 1 && (
+                <div style={{ marginBottom: '1.5rem' }}>
+                  <label style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.5rem', fontWeight: 600 }}>
+                    Batch Edit ({selectedIds.length} selected)
+                  </label>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    <button
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.65rem', justifyContent: 'center' }}
+                      onClick={() => handleElementChange(selectedIds, { visible: true })}
+                    ><Eye size={12} /> Show All</button>
+                    <button
+                      className="btn btn-secondary"
+                      style={{ fontSize: '0.65rem', justifyContent: 'center' }}
+                      onClick={() => handleElementChange(selectedIds, { visible: false })}
+                    ><EyeOff size={12} /> Hide All</button>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '0.65rem', color: 'var(--text-secondary)', marginBottom: '3px' }}>Set Opacity</label>
+                        <input
+                          type="range" min="0" max="1" step="0.05"
+                          defaultValue="1"
+                          onChange={(e) => handleElementChange(selectedIds, { opacity: parseFloat(e.target.value) })}
+                          style={{ width: '100%', height: '4px' }}
+                        />
+                      </div>
+                      <div>
+                        <label style={{ display: 'block', fontSize: '0.65rem', color: 'var(--text-secondary)', marginBottom: '3px' }}>Set Fill</label>
+                        <input
+                          type="color"
+                          defaultValue="#ffffff"
+                          onChange={(e) => handleElementChange(selectedIds, { fill: e.target.value })}
+                          style={{ width: '100%', height: '28px', padding: 0, border: 'none', background: 'none' }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </motion.div>
           </AnimatePresence>
         ) : (
@@ -1989,6 +2476,192 @@ const App: React.FC = () => {
         )}
       </aside>
       </div>{/* end GFX editor flex row */}
+
+      {/* ── Sprite Keyframe Timeline Panel ─────────────────────────────── */}
+      {showKeyframes && (
+        <div style={{ flexShrink: 0, height: keyframeHeight, display: 'flex', flexDirection: 'column', borderTop: '1px solid var(--border-color)', background: 'var(--bg-secondary)', position: 'relative' }}>
+          {/* Resize handle */}
+          <div
+            style={{ position: 'absolute', top: 0, left: 0, right: 0, height: '4px', cursor: 'row-resize', zIndex: 5 }}
+            onMouseDown={e => { keyframeDragRef.current = { startY: e.clientY, startH: keyframeHeight }; }}
+          />
+
+          {/* Header */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 12px', borderBottom: '1px solid var(--border-color)', flexShrink: 0, height: '28px' }}>
+            <span style={{ fontSize: '0.65rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-secondary)' }}>Sprite Keyframes</span>
+            <span style={{ fontSize: '0.55rem', opacity: 0.4 }}>
+              {Object.values(library).filter((d: any) => d.type === 'sprite').length} sprites
+            </span>
+            <div style={{ marginLeft: 'auto', display: 'flex', gap: '6px', alignItems: 'center' }}>
+              <span style={{ fontSize: '0.55rem', opacity: 0.4 }}>Click a frame to navigate · Current: F{currentFrame + 1}</span>
+              <button
+                onClick={() => setShowKeyframes(false)}
+                style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: '0.75rem', padding: '0 4px', lineHeight: 1 }}
+                title="Close keyframe panel"
+              >✕</button>
+            </div>
+          </div>
+
+          {/* Timeline grid */}
+          <div className="scroll-thin" style={{ flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
+            {/* Root timeline row */}
+            {currentFrameCount > 1 && (() => {
+              const CELL = 14;
+              return (
+                <div style={{ display: 'flex', alignItems: 'stretch', borderBottom: '1px solid rgba(255,255,255,0.04)', minWidth: 'max-content' }}>
+                  {/* Label */}
+                  <div style={{ width: 140, flexShrink: 0, display: 'flex', alignItems: 'center', padding: '0 8px', borderRight: '1px solid rgba(255,255,255,0.06)', background: 'rgba(0,0,0,0.2)' }}>
+                    <span
+                      style={{ fontSize: '0.6rem', color: 'var(--accent-primary)', fontWeight: 700, cursor: 'pointer', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      onClick={() => { setCurrentContext(0); setNavigationStack([]); }}
+                      title="Root timeline"
+                    >ROOT</span>
+                  </div>
+                  {/* Cells */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '1px', padding: '2px 4px' }}>
+                    {Array.from({ length: currentFrameCount }, (_, fi) => {
+                      const isCurrentF = fi === currentFrame;
+                      const label = gfxMeta?.frameLabels?.find((l: any) => l.offset === fi)?.name;
+                      const hasScript = allFrameScripts.has(fi);
+                      return (
+                        <div
+                          key={fi}
+                          title={label ? `Frame ${fi + 1}: ${label}` : `Frame ${fi + 1}`}
+                          onClick={() => handleFrameChange(fi)}
+                          style={{
+                            width: CELL, height: 18, flexShrink: 0, borderRadius: '2px', cursor: 'pointer',
+                            background: isCurrentF
+                              ? 'var(--accent-primary)'
+                              : label
+                                ? 'rgba(96,165,250,0.55)'
+                                : hasScript
+                                  ? 'rgba(74,222,128,0.35)'
+                                  : 'rgba(255,255,255,0.08)',
+                            border: isCurrentF ? '1px solid var(--accent-primary)' : '1px solid transparent',
+                            position: 'relative',
+                          }}
+                        >
+                          {label && (
+                            <div style={{ position: 'absolute', top: -10, left: 0, fontSize: '0.45rem', color: '#60a5fa', whiteSpace: 'nowrap', pointerEvents: 'none', fontWeight: 700 }}>
+                              {label}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Sprite rows */}
+            {Object.entries(library)
+              .filter(([, def]: [string, any]) => def.type === 'sprite' && def.frameCount > 1)
+              .sort(([a], [b]) => parseInt(a) - parseInt(b))
+              .map(([idStr, def]: [string, any]) => {
+                const sprId = parseInt(idStr);
+                const fc: number = def.frameCount;
+                const labels: { offset: number; name: string }[] = def.frameLabels || [];
+                const sprFrameScriptFrames = new Set<number>();
+                for (let fi = 0; fi < (def.frames || []).length; fi++) {
+                  for (const t of (def.frames[fi] || [])) {
+                    if (t.type === 'doAction' || t.type === 'doInitAction') sprFrameScriptFrames.add(fi);
+                  }
+                }
+                const curSprFrame = compositeMode ? (spriteFramesRef.current.get(sprId) ?? 0) : (currentContext === sprId ? currentFrame : -1);
+                const isActiveContext = currentContext === sprId;
+                const CELL = 14;
+
+                return (
+                  <div
+                    key={sprId}
+                    style={{ display: 'flex', alignItems: 'stretch', borderBottom: '1px solid rgba(255,255,255,0.04)', minWidth: 'max-content', background: isActiveContext ? 'rgba(99,102,241,0.06)' : undefined }}
+                  >
+                    {/* Label */}
+                    <div style={{ width: 140, flexShrink: 0, display: 'flex', alignItems: 'center', padding: '0 8px', borderRight: '1px solid rgba(255,255,255,0.06)', background: isActiveContext ? 'rgba(99,102,241,0.12)' : 'rgba(0,0,0,0.15)' }}>
+                      <span
+                        style={{ fontSize: '0.6rem', color: isActiveContext ? 'var(--accent-primary)' : 'var(--text-secondary)', cursor: 'pointer', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontWeight: isActiveContext ? 700 : 400 }}
+                        onClick={() => {
+                          setCurrentContext(sprId);
+                          setNavigationStack(prev => [...prev.filter(n => n.id !== sprId), { id: sprId, name: def.name ?? `Sprite ${sprId}` }]);
+                          handleFrameChange(0);
+                        }}
+                        title={`Sprite ${sprId}${def.name ? ': ' + def.name : ''} (${fc} frames)`}
+                      >
+                        {def.name ? def.name : `Sprite ${sprId}`}
+                        <span style={{ opacity: 0.4, marginLeft: 4, fontSize: '0.5rem' }}>{fc}f</span>
+                      </span>
+                    </div>
+                    {/* Frame cells */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '1px', padding: '2px 4px' }}>
+                      {Array.from({ length: fc }, (_, fi) => {
+                        const isCur = fi === curSprFrame && curSprFrame >= 0;
+                        const lbl = labels.find(l => l.offset === fi)?.name;
+                        const hasAct = sprFrameScriptFrames.has(fi);
+                        // Check if any tags in this frame add/move elements
+                        const frameTags = def.frames[fi] || [];
+                        const hasPlace = frameTags.some((t: any) => t.type === 'placeObject' || t.type === 'placeObject2' || t.type === 'placeObject3');
+                        const hasRemove = frameTags.some((t: any) => t.type === 'removeObject' || t.type === 'removeObject2');
+                        return (
+                          <div
+                            key={fi}
+                            title={lbl ? `Frame ${fi + 1}: ${lbl}` : `Frame ${fi + 1}${hasAct ? ' [script]' : ''}${hasPlace ? ' [place]' : ''}${hasRemove ? ' [remove]' : ''}`}
+                            onClick={() => {
+                              if (isActiveContext) handleFrameChange(fi);
+                              else {
+                                setCurrentContext(sprId);
+                                setNavigationStack(prev => [...prev.filter(n => n.id !== sprId), { id: sprId, name: def.name ?? `Sprite ${sprId}` }]);
+                                handleFrameChange(fi);
+                              }
+                            }}
+                            style={{
+                              width: CELL, height: 16, flexShrink: 0, borderRadius: '2px', cursor: 'pointer',
+                              background: isCur
+                                ? 'var(--accent-primary)'
+                                : lbl
+                                  ? 'rgba(96,165,250,0.55)'
+                                  : hasAct
+                                    ? 'rgba(74,222,128,0.35)'
+                                    : hasPlace
+                                      ? 'rgba(99,102,241,0.3)'
+                                      : hasRemove
+                                        ? 'rgba(248,113,113,0.25)'
+                                        : 'rgba(255,255,255,0.07)',
+                              border: isCur ? '1px solid var(--accent-primary)' : '1px solid transparent',
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })
+            }
+
+            {Object.values(library).filter((d: any) => d.type === 'sprite' && d.frameCount > 1).length === 0 && currentFrameCount <= 1 && (
+              <div style={{ padding: '1rem', textAlign: 'center', color: 'var(--text-secondary)', fontSize: '0.7rem', opacity: 0.5 }}>
+                Load a GFX file to see sprite keyframes
+              </div>
+            )}
+          </div>
+
+          {/* Legend */}
+          <div style={{ display: 'flex', gap: '10px', padding: '3px 12px', borderTop: '1px solid rgba(255,255,255,0.04)', flexShrink: 0 }}>
+            {[
+              { color: 'var(--accent-primary)', label: 'Current frame' },
+              { color: 'rgba(96,165,250,0.55)', label: 'Label' },
+              { color: 'rgba(74,222,128,0.35)', label: 'Script' },
+              { color: 'rgba(99,102,241,0.3)', label: 'Place' },
+              { color: 'rgba(248,113,113,0.25)', label: 'Remove' },
+            ].map(({ color, label }) => (
+              <div key={label} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <div style={{ width: 10, height: 10, borderRadius: '2px', background: color, flexShrink: 0 }} />
+                <span style={{ fontSize: '0.55rem', color: 'var(--text-secondary)', opacity: 0.6 }}>{label}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>{/* end outer column wrapper */}
 
     {/* Script Editor Modal */}
@@ -2005,8 +2678,16 @@ const App: React.FC = () => {
             setCurrentScripts(sc);
           }
         }}
+        onRefresh={() => {
+          if (getElementsRef.current) {
+            const { elements: fe, scripts: sc } = getElementsRef.current(currentFrame, currentContext);
+            setElements(fe);
+            setCurrentScripts(sc);
+          }
+        }}
       />
     )}
+    </div>{/* end outer app flex-column */}
     </>
   );
 };
@@ -2246,16 +2927,26 @@ interface ScriptEditorModalProps {
   parserRef: React.RefObject<GFXParser | null>;
   onClose: () => void;
   onPatched: () => void;
+  onRefresh?: () => void;
 }
 
-const ScriptEditorModal: React.FC<ScriptEditorModalProps> = ({ script, parserRef, onClose, onPatched }) => {
+const ScriptEditorModal: React.FC<ScriptEditorModalProps> = ({ script, parserRef, onClose, onPatched, onRefresh }) => {
   const isAVM2 = script.abc instanceof Uint8Array || script.scriptType === 'AS3';
   const rawData = React.useMemo<Uint8Array>(() => {
-    if (script.data instanceof Uint8Array) return script.data;
-    if (script.abc instanceof Uint8Array) return script.abc;
-    if (Array.isArray(script.data)) return new Uint8Array(script.data);
-    return new Uint8Array();
-  }, [script]);
+    // For DoABC scripts, always read the current (possibly-patched) bytes from
+    // the patcher so that closing and reopening the editor reflects the latest patch.
+    if (script._abcKey) {
+      const live = parserRef.current?._patcher?.readDoABCBytes(script._abcKey);
+      console.log(`[ScriptEditor] rawData source: patcher readDoABCBytes("${script._abcKey}") → ${live ? live.length + ' bytes' : 'null'}`);
+      if (live && live.length > 0) return live;
+    }
+    const fallback = script.data instanceof Uint8Array ? script.data
+                   : script.abc instanceof Uint8Array  ? script.abc
+                   : Array.isArray(script.data)        ? new Uint8Array(script.data)
+                   : new Uint8Array();
+    console.log(`[ScriptEditor] rawData source: fallback script.abc/data → ${fallback.length} bytes`);
+    return fallback;
+  }, [script, parserRef]);
 
   const [activeTab, setActiveTab] = React.useState<'dis' | 'hex' | 'actions' | 'as3'>('dis');
   const [hexText, setHexText]         = React.useState('');
@@ -2265,6 +2956,7 @@ const ScriptEditorModal: React.FC<ScriptEditorModalProps> = ({ script, parserRef
   const [as3Source, setAs3Source]     = React.useState('// AS3 source not yet decompiled.\n// Edit here, then click Compile & Save.');
   const [as3Error, setAs3Error]       = React.useState('');
   const [as3Status, setAs3Status]     = React.useState('');
+  const [as3Compiling, setAs3Compiling] = React.useState(false);
 
   React.useEffect(() => {
     // Format hex as 16 bytes per line
@@ -2333,28 +3025,47 @@ const ScriptEditorModal: React.FC<ScriptEditorModalProps> = ({ script, parserRef
   const compileAndSave = () => {
     setAs3Error('');
     setAs3Status('');
-    try {
-      const patcher = parserRef.current?._patcher;
-      if (!patcher) { setAs3Error('No patcher available.'); return; }
-      if (!script._abcKey) { setAs3Error('No ABC key — cannot patch.'); return; }
+    setAs3Compiling(true);
+    // Use setTimeout to let React flush the "compiling" state before heavy sync work
+    setTimeout(() => {
+      try {
+        const patcher = parserRef.current?._patcher;
+        if (!patcher) { setAs3Error('No patcher available.'); setAs3Compiling(false); return; }
+        if (!script._abcKey) { setAs3Error('No ABC key — cannot patch.'); setAs3Compiling(false); return; }
 
-      // Compile the edited source to a new single-class ABC
-      const cls = parseAS3(as3Source);
-      const newABCFile = compileAS3(cls);
-      const newClassBytes = serialiseABC(newABCFile);
+        // Parse and compile the edited AS3 source
+        const cls = parseAS3(as3Source);
+        console.log(`[Compile] Parsed class: pkg="${cls.pkg}" name="${cls.name}" methods=${cls.methods.length} fields=${cls.fields.length}`);
+        const newABCFile = compileAS3(cls);
+        const newClassBytes = serialiseABC(newABCFile);
+        console.log(`[Compile] Compiled class bytes: ${newClassBytes.length}`);
 
-      // Merge the compiled class back into the ORIGINAL full ABC
-      // (the DoABC tag may contain many classes — we only replace the target one)
-      const origABCBytes = rawData; // rawData = the full ABC bytes for this DoABC tag
-      const mergedBytes = mergeClassIntoABC(origABCBytes, newClassBytes, script._className ?? cls.name);
+        // Merge compiled class back into the original full ABC blob
+        const origABCBytes = rawData;
+        console.log(`[Compile] origABCBytes: ${origABCBytes.length}, merging as class="${script._className ?? cls.name}"`);
+        const mergedBytes = mergeClassIntoABC(origABCBytes, newClassBytes, script._className ?? cls.name);
+        console.log(`[Compile] mergedBytes: ${mergedBytes.length} (delta ${mergedBytes.length - origABCBytes.length})`);
 
-      const ok = patcher.patchDoABC(script._abcKey, mergedBytes);
-      if (!ok) { setAs3Error(`ABC key "${script._abcKey}" not found in binary.`); return; }
-      setAs3Status(`Compiled & merged ${mergedBytes.length} bytes → ${script._abcKey}`);
-      onPatched();
-    } catch (e: any) {
-      setAs3Error((e as Error).message ?? String(e));
-    }
+        const ok = patcher.patchDoABC(script._abcKey, mergedBytes);
+        console.log(`[Compile] patchDoABC("${script._abcKey}") → ${ok}`);
+        if (ok) {
+          const verify = patcher.readDoABCBytes(script._abcKey);
+          console.log(`[Compile] verify readDoABCBytes after patch → ${verify?.length} bytes (expected ${mergedBytes.length})`);
+        }
+        if (!ok) {
+          setAs3Error(`ABC key "${script._abcKey}" not found in binary.`);
+          setAs3Compiling(false);
+          return;
+        }
+
+        setAs3Status(`✓ Patched ${mergedBytes.length} bytes into ${script._abcKey}. Use Save File to write to disk.`);
+        setAs3Compiling(false);
+        onRefresh?.();
+      } catch (e: any) {
+        setAs3Error(String((e as Error).message || e));
+        setAs3Compiling(false);
+      }
+    }, 20);
   };
 
   const monoFont = '"Cascadia Code","Fira Code","Consolas",monospace';
@@ -2524,12 +3235,26 @@ const ScriptEditorModal: React.FC<ScriptEditorModalProps> = ({ script, parserRef
                 )}
                 <div style={{ marginLeft: 'auto', display: 'flex', gap: '8px', alignItems: 'center' }}>
                   {script._abcKey && (
-                    <button onClick={compileAndSave} style={btnSm('#c084fc')}>Compile &amp; Save</button>
+                    <button
+                      onClick={compileAndSave}
+                      disabled={as3Compiling}
+                      style={{ ...btnSm('#c084fc'), opacity: as3Compiling ? 0.5 : 1, cursor: as3Compiling ? 'default' : 'pointer' }}
+                    >
+                      {as3Compiling ? 'Compiling…' : 'Compile & Save'}
+                    </button>
                   )}
                 </div>
               </div>
-              {as3Error  && <p style={{ fontSize: '0.65rem', color: '#f87171', margin: 0, flexShrink: 0 }}>{as3Error}</p>}
-              {as3Status && <p style={{ fontSize: '0.65rem', color: '#4ade80', margin: 0, flexShrink: 0 }}>{as3Status}</p>}
+              {as3Error  && (
+                <p style={{ fontSize: '0.65rem', color: '#f87171', margin: 0, flexShrink: 0, background: '#2a0f0f', padding: '6px 10px', borderRadius: '4px', border: '1px solid #7f1d1d' }}>
+                  ✗ {as3Error}
+                </p>
+              )}
+              {as3Status && (
+                <p style={{ fontSize: '0.65rem', color: '#4ade80', margin: 0, flexShrink: 0, background: '#0a2a0a', padding: '6px 10px', borderRadius: '4px', border: '1px solid #14532d' }}>
+                  {as3Status}
+                </p>
+              )}
               <textarea
                 value={as3Source}
                 onChange={e => { setAs3Source(e.target.value); setAs3Error(''); setAs3Status(''); }}
@@ -2570,6 +3295,44 @@ const RenderElement: React.FC<RenderElementProps> = ({ element, onSelect, onChan
 
   const interactiveStroke = isInteractive ? { stroke: '#f97316', strokeWidth: 1.5, dash: [4, 2] } : {};
 
+  // Drop shadow / glow props for Konva
+  const shadowProps = element.shadowColor ? {
+    shadowColor:   element.shadowColor,
+    shadowBlur:    element.shadowBlur    ?? 4,
+    shadowOffsetX: element.shadowOffsetX ?? 0,
+    shadowOffsetY: element.shadowOffsetY ?? 0,
+    shadowOpacity: 1,
+  } : element.filterGlow ? {
+    shadowColor:   element.filterGlow,
+    shadowBlur:    element.filterGlowBlur ?? 8,
+    shadowOffsetX: 0,
+    shadowOffsetY: 0,
+    shadowOpacity: 1,
+  } : {};
+
+  // Resolve the actual SVG path for morph shapes
+  const resolvedSvgPath = (() => {
+    if (element.morphStartPath != null && element.morphRatio != null) {
+      const ratio = element.morphRatio;
+      if (ratio <= 0) return element.morphStartPath;
+      if (ratio >= 1) return element.morphEndPath ?? element.morphStartPath;
+      // Interpolate numerically
+      const re = /(-?[\d.]+)/g;
+      const sNums = [...(element.morphStartPath?.matchAll(re) ?? [])].map(m => parseFloat(m[0]));
+      const eNums = [...((element.morphEndPath ?? element.morphStartPath).matchAll(re) ?? [])].map(m => parseFloat(m[0]));
+      if (sNums.length === eNums.length) {
+        let i = 0;
+        return element.morphStartPath.replace(re, () => {
+          const v = sNums[i] * (1 - ratio) + eNums[i] * ratio;
+          i++;
+          return v.toFixed(2);
+        });
+      }
+      return ratio < 0.5 ? element.morphStartPath : (element.morphEndPath ?? element.morphStartPath);
+    }
+    return element.svgPath;
+  })();
+
   const commonProps = {
     id: element.id,
     x: element.x,
@@ -2586,6 +3349,7 @@ const RenderElement: React.FC<RenderElementProps> = ({ element, onSelect, onChan
     onDragEnd: onDragEnd,
     onMouseEnter: onHoverEnter,
     onMouseLeave: onHoverLeave,
+    ...shadowProps,
     onTransformEnd: (e: any) => {
       const node = shapeRef.current;
       const newScaleX = node.scaleX();
@@ -2611,8 +3375,8 @@ const RenderElement: React.FC<RenderElementProps> = ({ element, onSelect, onChan
     const toKonvaStops = (stops: Array<{offset:number,r:number,g:number,b:number,a:number}>) =>
       stops.flatMap(s => [s.offset, `rgba(${s.r},${s.g},${s.b},${s.a.toFixed(3)})`]);
 
-    // If we have an SVG path, render it as a proper vector shape
-    if (element.svgPath) {
+    // If we have an SVG path (including interpolated morph paths), render as vector shape
+    if (resolvedSvgPath) {
       const gf = element.gradientFill;
       const slb = element.shapeLocalBounds;
       if (gf && slb && gf.stops.length >= 2) {
@@ -2622,7 +3386,7 @@ const RenderElement: React.FC<RenderElementProps> = ({ element, onSelect, onChan
         if (gf.type === 'radial') {
           return <Path
             {...commonProps}
-            data={element.svgPath}
+            data={resolvedSvgPath}
             fillRadialGradientStartPoint={{ x: cx, y: cy }}
             fillRadialGradientEndPoint={{ x: cx, y: cy }}
             fillRadialGradientStartRadius={0}
@@ -2635,7 +3399,7 @@ const RenderElement: React.FC<RenderElementProps> = ({ element, onSelect, onChan
         }
         return <Path
           {...commonProps}
-          data={element.svgPath}
+          data={resolvedSvgPath}
           fillLinearGradientStartPoint={{ x: slb.x, y: cy }}
           fillLinearGradientEndPoint={{ x: slb.x + slb.w, y: cy }}
           fillLinearGradientColorStops={stops}
@@ -2644,10 +3408,20 @@ const RenderElement: React.FC<RenderElementProps> = ({ element, onSelect, onChan
           dash={isInteractive ? [4, 2] : undefined}
         />;
       }
+      // Morph fill: interpolate between start and end fill colors if both present
+      const morphFill = (() => {
+        if (element.morphStartFill && element.morphEndFill && element.morphRatio != null) {
+          const r = element.morphRatio;
+          if (r <= 0) return element.morphStartFill;
+          if (r >= 1) return element.morphEndFill;
+          return element.morphStartFill; // colour interpolation is complex; just use start for now
+        }
+        return element.fill;
+      })();
       return <Path
         {...commonProps}
-        data={element.svgPath}
-        fill={element.fill === 'transparent' ? undefined : element.fill}
+        data={resolvedSvgPath}
+        fill={morphFill === 'transparent' ? undefined : morphFill}
         stroke={isInteractive ? '#f97316' : element.stroke}
         strokeWidth={isInteractive ? 1.5 : (element.strokeWidth || 0)}
         dash={isInteractive ? [4, 2] : undefined}

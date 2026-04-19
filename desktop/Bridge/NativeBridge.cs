@@ -98,6 +98,7 @@ public sealed class NativeBridge : IDisposable
             {
                 "openFile"        => await HandleOpenFile(args),
                 "openTexturePack" => HandleOpenTexturePack(),
+                "readFile"        => HandleReadFile(args),
                 "saveFile"        => await HandleSaveFile(args),
                 "saveFileDialog"  => HandleSaveFileDialog(args),
                 "pickDirectory"   => HandlePickDirectory(),
@@ -113,6 +114,26 @@ public sealed class NativeBridge : IDisposable
         {
             await Reject(id, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Reads a file at the given absolute path and returns its bytes as base64.
+    /// Used for auto-loading dependency GFX files (widgetarray.gfx etc.) without
+    /// showing an open-file dialog.
+    /// </summary>
+    private object HandleReadFile(JsonElement args)
+    {
+        string? path = TryGetString(args, "path");
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return new { cancelled = true };
+        var bytes = File.ReadAllBytes(path);
+        return new
+        {
+            cancelled  = false,
+            name       = Path.GetFileName(path),
+            path,
+            dataBase64 = Convert.ToBase64String(bytes),
+        };
     }
 
     private Task<object> HandleOpenFile(JsonElement args)

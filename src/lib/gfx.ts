@@ -203,6 +203,65 @@ function extractOpacity(cx: any): number {
     return Math.max(0, Math.min(1, effective));
 }
 
+/** Extract all SWF filter effects from a PlaceObject filter list. */
+function extractFilters(filters: any[]): {
+    shadowColor?: string;
+    shadowBlur?: number;
+    shadowOffsetX?: number;
+    shadowOffsetY?: number;
+    filterBlur?: number;
+    filterGlow?: string;
+    filterGlowBlur?: number;
+} {
+    if (!filters?.length) return {};
+    const out: ReturnType<typeof extractFilters> = {};
+    for (const f of filters) {
+        if (!f) continue;
+        const blurX = f.blurX?.epsilons != null ? f.blurX.epsilons / 65536 : (typeof f.blurX === 'number' ? f.blurX : 0);
+        if (f.color && (f.distance != null || f.angle != null)) {
+            // DropShadow filter (type 0)
+            const { r = 0, g = 0, b = 0, a = 255 } = f.color;
+            const angle = f.angle?.epsilons != null ? f.angle.epsilons / 65536 : (typeof f.angle === 'number' ? f.angle : 0);
+            const dist  = f.distance?.epsilons != null ? f.distance.epsilons / 65536 : (typeof f.distance === 'number' ? f.distance : 0);
+            if (!out.shadowColor) {
+                out.shadowColor   = `rgba(${r},${g},${b},${(a / 255).toFixed(3)})`;
+                out.shadowBlur    = blurX;
+                out.shadowOffsetX = Math.cos(angle) * dist;
+                out.shadowOffsetY = Math.sin(angle) * dist;
+            }
+        } else if (f.color && f.distance == null) {
+            // Glow filter (type 2) — no distance, renders as centered glow
+            const { r = 0, g = 0, b = 0, a = 255 } = f.color;
+            if (!out.filterGlow) {
+                out.filterGlow     = `rgba(${r},${g},${b},${(a / 255).toFixed(3)})`;
+                out.filterGlowBlur = blurX;
+            }
+        } else if (!f.color && blurX > 0) {
+            // Blur filter (type 1)
+            if (!out.filterBlur) out.filterBlur = blurX;
+        }
+    }
+    return out;
+}
+
+/** Linearly interpolate between two SVG path strings that share the same command structure. */
+function interpolateMorphPath(startPath: string | null, endPath: string | null, ratio: number): string | null {
+    if (!startPath) return endPath;
+    if (!endPath)   return startPath;
+    if (ratio <= 0) return startPath;
+    if (ratio >= 1) return endPath;
+    const re = /(-?[\d.]+)/g;
+    const sNums = [...startPath.matchAll(re)].map(m => parseFloat(m[0]));
+    const eNums = [...endPath.matchAll(re)].map(m => parseFloat(m[0]));
+    if (sNums.length !== eNums.length) return ratio < 0.5 ? startPath : endPath;
+    let i = 0;
+    return startPath.replace(re, () => {
+        const v = sNums[i] * (1 - ratio) + eNums[i] * ratio;
+        i++;
+        return v.toFixed(2);
+    });
+}
+
 
 
 // Convert SWF shape records to an SVG path string
@@ -210,37 +269,40 @@ function shapeToSvgPath(shape: any): string | null {
     if (!shape || !shape.records) return null;
     let path = '';
     let curX = 0, curY = 0;
+    let hasOpenSubpath = false;
 
     for (const rec of shape.records) {
         if (rec.type === 1) {
-            // StyleChange with moveTo
+            // StyleChange — ShapeRecordType.StyleChange = 1
             if (rec.moveTo) {
+                // Close any open subpath before starting a new one
+                if (hasOpenSubpath) path += 'Z ';
                 curX = rec.moveTo.x / 20;
                 curY = rec.moveTo.y / 20;
                 path += `M ${curX} ${curY} `;
+                hasOpenSubpath = true;
             }
         } else if (rec.type === 0) {
-            // StraightEdge
-            if (rec.delta) {
+            // Edge — ShapeRecordType.Edge = 0 (straight OR curved)
+            // Curved edge: controlDelta is present; delta = total displacement start→end
+            if (rec.controlDelta) {
+                const cx = curX + rec.controlDelta.x / 20;
+                const cy = curY + rec.controlDelta.y / 20;
+                const ax = curX + rec.delta.x / 20;
+                const ay = curY + rec.delta.y / 20;
+                path += `Q ${cx} ${cy} ${ax} ${ay} `;
+                curX = ax;
+                curY = ay;
+            } else if (rec.delta) {
+                // Straight edge
                 curX += rec.delta.x / 20;
                 curY += rec.delta.y / 20;
                 path += `L ${curX} ${curY} `;
             }
-        } else if (rec.type === 2) {
-            // CurvedEdge
-            if (rec.controlDelta && rec.anchorDelta) {
-                const cx = curX + rec.controlDelta.x / 20;
-                const cy = curY + rec.controlDelta.y / 20;
-                const ax = cx + rec.anchorDelta.x / 20;
-                const ay = cy + rec.anchorDelta.y / 20;
-                path += `Q ${cx} ${cy} ${ax} ${ay} `;
-                curX = ax;
-                curY = ay;
-            }
         }
     }
-    if (path) path += 'Z';
-    return path || null;
+    if (hasOpenSubpath) path += 'Z';
+    return path.trim() || null;
 }
 
 // Gather all fill styles from a shape (both initialStyles and inline newStyles in records)
@@ -266,6 +328,22 @@ function gatherLineStyles(shape: any): any[] {
         }
     }
     return lines;
+}
+
+// Merge a PlaceObject update tag into the existing depth-map entry.
+//
+// swf-parser explicitly sets every field it did NOT read to `undefined` in the returned object.
+// A naive { ...prev, ...t } therefore OVERWRITES every defined prev field (matrix, characterId,
+// colorTransform, filters, name, …) with undefined whenever the update tag omits that field.
+//
+// Fix: strip all undefined-valued fields from `t` before spreading, so only the fields the
+// update tag actually carries overwrite the accumulated state in `prev`.
+function mergeDepthEntry(prev: any, t: any, placedAtFrame: number): any {
+    const delta: any = {};
+    for (const key of Object.keys(t)) {
+        if (t[key] !== undefined) delta[key] = t[key];
+    }
+    return { ...prev, ...delta, _placedAtFrame: placedAtFrame };
 }
 
 // Sanitize tags to remove circular or non-serializable swf-parser internals
@@ -921,6 +999,80 @@ export function parseABCClassNames(data: Uint8Array): string[] {
     }
 }
 
+// ─── Cross-file dependency merging ───────────────────────────────────────────
+//
+// In the SWF ImportAssets model, dep file characters are referenced by their
+// ORIGINAL dep-file IDs in the main file's PlaceObject tags.  For example, if
+// widgetarray.gfx defines character 201 (a shared base component) and
+// fileshareroot.gfx's sprites reference character 201, the game engine simply
+// merges widgetarray's character table into the active dictionary.
+//
+// Strategy (no ID remapping):
+//  1. Copy all dep characters into main dict at their ORIGINAL IDs, skipping any
+//     ID that the main file already defines as a real (non-imported) character.
+//  2. For every ImportAssets placeholder in main dict, find the dep-exported
+//     character by class name and ALSO store it at the placeholder's imported ID
+//     (some files import a widget under a different local ID).
+
+/**
+ * Merge a dependency file's library into the main file's library.
+ * Both objects are mutated in place — call once per dep, before setLibrary().
+ */
+export function mergeDependencyLibrary(
+    mainLib: Record<number, any>,
+    depLib: Record<number, any>,
+): void {
+    let copied = 0, skippedReal = 0, skippedImported = 0, resolved = 0;
+
+    // Step 1: fill gaps — copy dep chars at their original IDs only where
+    // mainLib has no entry at all. Occupied real-char slots and _imported
+    // placeholders are left alone; _imported slots are resolved in step 2.
+    for (const idStr of Object.keys(depLib)) {
+        const depId = parseInt(idStr);
+        if (isNaN(depId)) continue; // skip 'script_...' keys
+        const existing = mainLib[depId];
+        if (existing) {
+            if (existing._imported) skippedImported++;
+            else skippedReal++;
+            continue;
+        }
+        mainLib[depId] = { ...depLib[depId] };
+        copied++;
+    }
+
+    // Step 2: resolve ImportAssets placeholders by class name.
+    // The placeholder's local ID may differ from the dep file's original ID;
+    // always put the resolved definition at the imported (local) ID.
+    for (const idStr of Object.keys(mainLib)) {
+        const entry = mainLib[parseInt(idStr)];
+        if (!entry?._imported || !entry.className) continue;
+        const importedId = parseInt(idStr);
+
+        for (const depIdStr of Object.keys(depLib)) {
+            const depEntry = depLib[parseInt(depIdStr)];
+            if (!depEntry?._exported || depEntry.className !== entry.className) continue;
+
+            // Put the named dep character at the imported ID
+            mainLib[importedId] = { ...depEntry, id: importedId, _resolvedFrom: entry._importUrl };
+            resolved++;
+
+            // Also ensure the dep character exists at its *original* dep ID so that
+            // any internal references from its own frames can resolve correctly.
+            const depOrigId = parseInt(depIdStr);
+            if (!mainLib[depOrigId]) {
+                mainLib[depOrigId] = { ...depEntry };
+            }
+            break;
+        }
+    }
+
+    if (skippedImported > 0 || skippedReal > 0) {
+        console.warn(`[Deps] mergeDependencyLibrary: copied=${copied} resolved=${resolved} skipped(real=${skippedReal} _imported=${skippedImported}) — ${skippedImported} dep chars blocked by _imported placeholders may cause red boxes`);
+    } else {
+        console.log(`[Deps] mergeDependencyLibrary: copied=${copied} resolved=${resolved}`);
+    }
+}
+
 export class GFXParser {
     private fileBuffer: Uint8Array;
     /** Kept for the patch-based compiler; populated in toModernFormat() */
@@ -964,6 +1116,7 @@ export class GFXParser {
             frameCount: any;
             version: any;
             frameLabels: {offset: number, name: string}[];
+            dependencies: string[];
         } = {
             stageW,
             stageH,
@@ -971,11 +1124,74 @@ export class GFXParser {
             frameCount,
             version: header.version,
             frameLabels: [],
+            dependencies: [],
         };
 
         // =========== PASS 1: Build dictionary of all definitions ===========
+        // SWF tag codes that are control tags (NOT character definitions).
+        // Bytes 0-1 in these tags are flags/offsets, NOT a character ID — exclude them
+        // from the RawBody 2-byte ID heuristic.
+        const SWF_CONTROL_CODES = new Set([
+            0,  // End
+            1,  // ShowFrame
+            4,  // PlaceObject
+            5,  // RemoveObject
+            9,  // SetBackgroundColor
+            26, // PlaceObject2
+            28, // RemoveObject2
+            43, // FrameLabel
+            59, // DoInitAction
+            65, // ScriptLimits
+            70, // PlaceObject3
+            77, // Metadata
+        ]);
+
         const processDefs = (tagList: any[]) => {
             for (const tag of tagList) {
+                // Handle ImportAssets / ImportAssets2 (SWF tags 57 / 71).
+                // swf-parser returns { type: TagType.ImportAssets, url, assets: [{id, name}] }
+                // with no top-level tag.id, so it bypasses the id guard below.
+                // Register each imported character as a labeled placeholder sprite so
+                // PlaceObject references to them don't produce red boxes.
+                if (Array.isArray(tag.assets)) {
+                    for (const asset of tag.assets) {
+                        if (asset.id != null && !dictionary[asset.id]) {
+                            dictionary[asset.id] = {
+                                id: asset.id,
+                                type: 'sprite',
+                                frameCount: 1,
+                                frames: [[]],
+                                frameLabels: [],
+                                className: asset.name,
+                                _imported: true,
+                                _importUrl: tag.url,
+                            };
+                        }
+                    }
+                    continue;
+                }
+
+                // Handle RawBody tags (swf-parser type 53 = unknown/GFX-extension tag codes).
+                // In SWF format, character-definition tags begin with a 2-byte character ID.
+                // Skip known control tag codes where bytes 0-1 are NOT a character ID.
+                if (tag.type === 53 && tag.code != null && tag.data instanceof Uint8Array && tag.data.length >= 2) {
+                    if (!SWF_CONTROL_CODES.has(tag.code)) {
+                        const rawId = tag.data[0] | (tag.data[1] << 8);
+                        if (rawId > 0 && rawId <= 0xFFFE && !dictionary[rawId]) {
+                            console.warn(`[GFX] RawBody tag code=${tag.code} — assuming character id=${rawId}, registering empty sprite`);
+                            dictionary[rawId] = {
+                                id: rawId,
+                                type: 'sprite',
+                                frameCount: 1,
+                                frames: [[]],
+                                frameLabels: [],
+                                _rawTagCode: tag.code,
+                            };
+                        }
+                    }
+                    continue;
+                }
+
                 if (tag.id == null) continue;
 
                 // Shapes (DefineShape variants)
@@ -1058,6 +1274,27 @@ export class GFXParser {
                     const letterSpacingMatch = rawText.match(/letterSpacing="([^"]+)"/i);
                     if (letterSpacingMatch && dictionary[tag.id]) dictionary[tag.id].letterSpacing = parseFloat(letterSpacingMatch[1]);
                 }
+                // DefineMorphShape / DefineMorphShape2 (SWF tags 46 / 84)
+                // Detected by presence of startBounds or startEdges alongside an id.
+                else if (tag.id != null && (tag.startBounds != null || tag.startEdges != null)) {
+                    const startShape = tag.startEdges ?? { records: [] };
+                    const endShape   = tag.endEdges   ?? { records: [] };
+                    const sb = tag.startBounds ?? tag.endBounds ?? { xMin:0, yMin:0, xMax:0, yMax:0 };
+                    const eb = tag.endBounds   ?? sb;
+                    dictionary[tag.id] = {
+                        id: tag.id,
+                        type: 'morph',
+                        xMin:    sb.xMin / 20,  yMin: sb.yMin / 20,
+                        width:   (sb.xMax - sb.xMin) / 20,
+                        height:  (sb.yMax - sb.yMin) / 20,
+                        endWidth: (eb.xMax - eb.xMin) / 20,
+                        endHeight:(eb.yMax - eb.yMin) / 20,
+                        morphStartPath: shapeToSvgPath(startShape),
+                        morphEndPath:   shapeToSvgPath(endShape),
+                        morphStartFill: extractFillColor(startShape),
+                        morphEndFill:   extractFillColor(endShape),
+                    };
+                }
                 // Sprite (MovieClip)
                 else if (tag.tags) {
                     const frames: any[][] = [[]];
@@ -1074,12 +1311,13 @@ export class GFXParser {
                     // The last frame is usually empty if there's a trailing ShowFrame
                     const finalFrameCount = tag.frameCount || (frames[cf].length === 0 ? cf : cf + 1);
 
-                    // Extract per-frame labels (FrameLabel tags have a `label` string field)
+                    // Extract per-frame labels (swf-parser FrameLabel tags use `name` field, type === 38)
                     const spriteFrameLabels: {frame: number, label: string}[] = [];
                     for (let fi = 0; fi < frames.length; fi++) {
                         for (const t of frames[fi]) {
-                            if (t.label && typeof t.label === 'string') {
-                                spriteFrameLabels.push({ frame: fi, label: t.label });
+                            // FrameLabel tag: type=38, name="label string"
+                            if (t.type === 38 && t.name && typeof t.name === 'string') {
+                                spriteFrameLabels.push({ frame: fi, label: t.name });
                             }
                         }
                     }
@@ -1094,13 +1332,49 @@ export class GFXParser {
                     };
                     processDefs(tag.tags);
                 }
-                // Scripts (DoAction = 12, DoABC = 82, DoInitAction = 59)
+                // DefineBitmap (swf-parser type 5: DefineBitsLossless/JPEG variants).
+                // Must come BEFORE the scripts check because DefineBitmap has tag.data
+                // (image bytes) which would otherwise be swallowed by the scripts branch.
+                else if (tag.width != null && tag.height != null) {
+                    dictionary[tag.id] = {
+                        id: tag.id,
+                        type: 'shape',
+                        xMin: 0, yMin: 0,
+                        width: tag.width,
+                        height: tag.height,
+                        svgPath: null,
+                        fill: 'rgba(80,80,80,0.4)',
+                        gradientFill: null,
+                        stroke: undefined,
+                        strokeWidth: 0,
+                        _isBitmap: true,
+                    };
+                }
+                // Scripts (DoAction = 12, DoABC = 82, DoInitAction = 59).
+                // Excludes DefineBitmap (handled above) via the width/height check order.
+                // NOTE: DefineFont, DefineSound, DefineButton also have `data` or `actions`
+                // but carry character IDs. Register them in the dictionary as well so
+                // PlaceObject references to them don't produce red boxes.
                 else if (tag.actions || tag.data || tag.abc) {
+                    // If this is a character-bearing tag (has id), register it so it's findable.
+                    // Pure script tags (DoABC, DoAction) reach here only because they were not
+                    // filtered by tag.id == null above — register them too as invisible sprites.
+                    if (!dictionary[tag.id]) {
+                        dictionary[tag.id] = {
+                            id: tag.id,
+                            type: 'sprite',
+                            frameCount: 1,
+                            frames: [[]],
+                            frameLabels: [],
+                            _nonVisual: true,
+                        };
+                    }
+
                     const scriptType = (tag.abc instanceof Uint8Array) ? 'AS3' : 'AS2';
                     const sanitized = sanitizeTag(tag);
                     const rawData = sanitized.data || sanitized.abc || new Uint8Array();
                     const disassembly = scriptType === 'AS3' ? disassembleAS3(rawData) : disassembleAS2(rawData);
-                    
+
                     (dictionary as any)[`script_${tag.id || Math.random()}`] = {
                         type: 'script',
                         scriptType,
@@ -1110,18 +1384,47 @@ export class GFXParser {
                         tagCode: tag.type
                     };
                 }
+                // Catch-all: any tag with a character ID that wasn't matched above.
+                // Register as an invisible empty sprite so it doesn't cause red boxes.
+                else {
+                    console.warn(`[GFX] Unrecognized character tag id=${tag.id} type=${tag.type} — registering as empty sprite`);
+                    dictionary[tag.id] = {
+                        id: tag.id,
+                        type: 'sprite',
+                        frameCount: 1,
+                        frames: [[]],
+                        frameLabels: [],
+                    };
+                }
             }
         };
         processDefs(tags);
 
-        // =========== PASS 2: Connect export/symbol names ===========
+        // =========== PASS 2: Connect export/symbol names; collect dependency URLs ===========
+        const depUrlSet = new Set<string>();
         for (const tag of tags) {
+            // ExportAssets / SymbolClass → mark characters as exported
             if (tag.symbols) {
                 for (const sym of tag.symbols) {
                     if (sym.id != null && dictionary[sym.id]) {
                         dictionary[sym.id].className = sym.name;
+                        dictionary[sym.id]._exported = true;
                     }
                 }
+            }
+            // ImportAssets — collect the dependency URL
+            if (Array.isArray(tag.assets) && tag.url) {
+                depUrlSet.add(tag.url);
+            }
+        }
+        gfxMeta.dependencies = [...depUrlSet];
+        if (depUrlSet.size > 0) {
+            console.log('[GFX] ImportAssets dependencies found:', [...depUrlSet]);
+        } else {
+            // Check if there are any ImportAssets-like tags that we might have missed
+            const rawImportTags = tags.filter((t: any) => t.type === 57 || t.type === 71);
+            if (rawImportTags.length > 0) {
+                console.warn('[GFX] Found ImportAssets tags but no dep URLs extracted:', rawImportTags.map((t: any) => JSON.stringify(t).slice(0, 200)));
             }
         }
 
@@ -1130,14 +1433,15 @@ export class GFXParser {
 
         // instantiate now threads parentSpriteId+depth so each leaf element
         // knows exactly which PlaceObject binary tag to patch on export.
-        // Parse frame labels from SceneAndFrameLabelData (type=21)
+        // Parse frame labels. AVM2 files use DefineSceneAndFrameLabelData (type=21, has .labels[]).
+        // AVM1/GFX files use individual FrameLabel tags (type=38, has .name) per frame.
+        // We collect both here; the per-frame ones are resolved below after rootFrames is built.
         const frameLabels: {offset: number, name: string}[] = [];
         for (const tag of tags) {
             if (tag.type === 21 && Array.isArray(tag.labels)) {
                 frameLabels.push(...tag.labels);
             }
         }
-        gfxMeta.frameLabels = frameLabels;
 
         const rootFrames: any[][] = [[]];
         let rootCurrentFrame = 0;
@@ -1155,6 +1459,18 @@ export class GFXParser {
             }
         }
 
+        // Collect AVM1-style per-frame FrameLabel tags (type=38) from root frames
+        if (frameLabels.length === 0) {
+            for (let fi = 0; fi < rootFrames.length; fi++) {
+                for (const t of rootFrames[fi]) {
+                    if (t.type === 38 && t.name && typeof t.name === 'string') {
+                        frameLabels.push({ offset: fi, name: t.name });
+                    }
+                }
+            }
+        }
+        gfxMeta.frameLabels = frameLabels;
+
         const instantiate = (
             characterId: number,
             matrix: Matrix,
@@ -1167,10 +1483,22 @@ export class GFXParser {
             parentGlobalScaleY: number = 1,
             parentOpacity: number = 1,
             targetFrame: number = 0,
-            spriteFrameMap?: Map<number, number>
+            spriteFrameMap?: Map<number, number>,
+            clipGroupId?: string,
+            isMaskEl?: boolean,
+            morphRatio: number = 0,
         ) => {
             const def = dictionary[characterId];
             if (!def) {
+                // Character ID not in dictionary — log so we can diagnose what's missing
+                const dictSize = Object.keys(dictionary).length;
+                // Check if there's an _imported placeholder nearby (collision hint)
+                const nearbyImported = [characterId-1, characterId, characterId+1]
+                    .map(id => dictionary[id])
+                    .filter(Boolean)
+                    .map((e: any) => e._imported ? `id=${e.id}[_imported: ${e.className}]` : `id=${e.id}[${e.type}]`)
+                    .join(', ');
+                console.warn(`[GFX] Unknown character id=${characterId} placed by parent sprite ${parentSpriteId} at depth ${placedAtDepth} — rendering red box (dictSize=${dictSize}${nearbyImported ? ', nearby: ' + nearbyImported : ''}`);
                 // Fallback for unknown definitions: render a placeholder box
                 elements.push({
                     id: `unknown_${characterId}_${elementIdx++}`,
@@ -1204,18 +1532,34 @@ export class GFXParser {
                         if (t.depth != null) {
                             if (t.type === 54 && depthMap[t.depth]) {
                                 delete depthMap[t.depth];
-                            } else if (t.characterId != null || t.isUpdate) {
+                            } else {
+                                // Apply: new placement (has characterId) OR update to existing entry
                                 const prev = depthMap[t.depth];
-                                const isNewPlacement = t.characterId != null && (!prev || prev.characterId !== t.characterId);
-                                depthMap[t.depth] = {
-                                    ...prev,
-                                    ...t,
-                                    _placedAtFrame: isNewPlacement ? f : (prev?._placedAtFrame ?? f),
-                                };
+                                if (t.characterId != null || prev != null) {
+                                    const isNewPlacement = t.characterId != null && (!prev || prev.characterId !== t.characterId);
+                                    depthMap[t.depth] = mergeDepthEntry(prev, t, isNewPlacement ? f : (prev?._placedAtFrame ?? f));
+                                }
                             }
                         }
                     }
                 }
+
+                // Pre-scan for clip mask ranges at this sprite level
+                type ClipRange = { fromDepth: number; toDepth: number; groupId: string };
+                const clipRanges: ClipRange[] = [];
+                for (const dStr of Object.keys(depthMap)) {
+                    const td = depthMap[+dStr];
+                    if (td.clipDepth > 0) {
+                        clipRanges.push({ fromDepth: parseInt(dStr), toDepth: td.clipDepth, groupId: `clip_${def.id}_${dStr}` });
+                    }
+                }
+                const resolveClip = (d: number): { groupId: string; isMask: boolean } | null => {
+                    for (const cr of clipRanges) {
+                        if (d === cr.fromDepth) return { groupId: cr.groupId, isMask: true };
+                        if (d > cr.fromDepth && d <= cr.toDepth) return { groupId: cr.groupId, isMask: false };
+                    }
+                    return null;
+                };
 
                 for (const depth in depthMap) {
                     const t = depthMap[depth];
@@ -1231,9 +1575,50 @@ export class GFXParser {
                             : (def.className ? `${namePrefix}${def.className} \u2192 ` : namePrefix);
                         // Pass frame relative to when the child was placed within this sprite's timeline
                         const childRelativeFrame = frameToUse - (t._placedAtFrame ?? 0);
-                        instantiate(charId, combined, childPrefix, t.name, t.filters || filters, def.id, t.depth, matrix.scaleX, matrix.scaleY, combinedOpacity, childRelativeFrame, spriteFrameMap);
+                        const clipInfo = resolveClip(parseInt(depth));
+                        const childMorphRatio = t.ratio != null ? t.ratio / 65535 : 0;
+                        instantiate(charId, combined, childPrefix, t.name, t.filters || filters, def.id, t.depth, matrix.scaleX, matrix.scaleY, combinedOpacity, childRelativeFrame, spriteFrameMap, clipInfo?.groupId, clipInfo?.isMask, childMorphRatio);
                     }
                 }
+            } else if (def.type === 'morph') {
+                // Morph shape — interpolate between start and end based on morphRatio
+                const ratio  = morphRatio;
+                const w      = Math.max(0.1, (def.width + (def.endWidth - def.width) * ratio) * Math.abs(matrix.scaleX));
+                const h      = Math.max(0.1, (def.height + (def.endHeight - def.height) * ratio) * Math.abs(matrix.scaleY));
+                const xPos   = matrix.translateX + (def.xMin * matrix.scaleX);
+                const yPos   = matrix.translateY + (def.yMin * matrix.scaleY);
+                const morphPath = interpolateMorphPath(def.morphStartPath, def.morphEndPath, ratio);
+                const morphFill = ratio <= 0 ? def.morphStartFill : (ratio >= 1 ? def.morphEndFill : def.morphStartFill);
+                const fxMap  = extractFilters(filters || []);
+                const displayName = instanceName
+                    ? `${namePrefix}${instanceName}`
+                    : `${namePrefix}Morph #${def.id}`;
+                elements.push({
+                    id: `el_${elementIdx++}`,
+                    name: displayName,
+                    type: 'rect',
+                    x: xPos, y: yPos, width: w, height: h,
+                    scaleX: matrix.scaleX, scaleY: matrix.scaleY,
+                    rotate0: matrix.rotate0, rotate1: matrix.rotate1,
+                    fill: morphFill,
+                    svgPath: morphPath ?? undefined,
+                    morphStartPath: def.morphStartPath ?? undefined,
+                    morphEndPath:   def.morphEndPath   ?? undefined,
+                    morphStartFill: def.morphStartFill ?? undefined,
+                    morphEndFill:   def.morphEndFill   ?? undefined,
+                    morphRatio: ratio,
+                    ...fxMap,
+                    visible: true, locked: false, opacity: parentOpacity,
+                    originalId: def.id, className: def.className,
+                    _patchKey: `${parentSpriteId}:${placedAtDepth}`,
+                    _origX: xPos, _origY: yPos,
+                    _origScaleX: matrix.scaleX, _origScaleY: matrix.scaleY,
+                    _parentScaleX: parentGlobalScaleX, _parentScaleY: parentGlobalScaleY,
+                    _spriteId: parentSpriteId,
+                    _spriteFrameCount: (dictionary[parentSpriteId] as any)?.frameCount ?? 1,
+                    _clipGroupId: clipGroupId,
+                    _isMask: isMaskEl,
+                });
             } else {
                 // Leaf node: shape or text
                 const w = Math.max(0.1, def.width * Math.abs(matrix.scaleX));
@@ -1250,6 +1635,8 @@ export class GFXParser {
                 const yPos = hasSvgPath
                     ? matrix.translateY
                     : matrix.translateY + (def.yMin * matrix.scaleY);
+
+                const fxMap = extractFilters(filters || []);
 
                 elements.push({
                     id: `el_${elementIdx++}`,
@@ -1271,8 +1658,7 @@ export class GFXParser {
                     _origColor: (def as any)._origColor,
                     fontSize: def.fontSize,
                     letterSpacing: def.letterSpacing,
-                    shadowColor: filters && filters[0] && filters[0].color ? `rgba(${filters[0].color.r},${filters[0].color.g},${filters[0].color.b},${filters[0].color.a / 255})` : undefined,
-                    shadowBlur: filters && filters[0] && filters[0].blurX ? filters[0].blurX.epsilons / 65536 * matrix.scaleX : undefined,
+                    ...fxMap,
                     svgPath: def.svgPath,
                     stroke: def.stroke,
                     strokeWidth: def.strokeWidth,
@@ -1298,6 +1684,8 @@ export class GFXParser {
                     _parentScaleY: parentGlobalScaleY,
                     _spriteId: parentSpriteId,
                     _spriteFrameCount: (dictionary[parentSpriteId] as any)?.frameCount ?? 1,
+                    _clipGroupId: clipGroupId,
+                    _isMask: isMaskEl,
                 });
             }
         };
@@ -1340,11 +1728,7 @@ export class GFXParser {
                             else {
                                 const prev = rootDepthMap[t.depth];
                                 const isNewPlacement = t.characterId != null && (!prev || prev.characterId !== t.characterId);
-                                rootDepthMap[t.depth] = {
-                                    ...prev,
-                                    ...t,
-                                    _placedAtFrame: isNewPlacement ? f : (prev?._placedAtFrame ?? f),
-                                };
+                                rootDepthMap[t.depth] = mergeDepthEntry(prev, t, isNewPlacement ? f : (prev?._placedAtFrame ?? f));
                             }
                         }
                     }
@@ -1369,6 +1753,21 @@ export class GFXParser {
                     }
                 }
 
+                // Pre-scan root depth map for clip ranges
+                type ClipRangeR = { fromDepth: number; toDepth: number; groupId: string };
+                const rootClipRanges: ClipRangeR[] = [];
+                for (const dStr of Object.keys(rootDepthMap)) {
+                    const td = rootDepthMap[+dStr];
+                    if (td.clipDepth > 0) rootClipRanges.push({ fromDepth: parseInt(dStr), toDepth: td.clipDepth, groupId: `clip_root_${dStr}` });
+                }
+                const resolveRootClip = (d: number): { groupId: string; isMask: boolean } | null => {
+                    for (const cr of rootClipRanges) {
+                        if (d === cr.fromDepth) return { groupId: cr.groupId, isMask: true };
+                        if (d > cr.fromDepth && d <= cr.toDepth) return { groupId: cr.groupId, isMask: false };
+                    }
+                    return null;
+                };
+
                 for (const depth in rootDepthMap) {
                     const t = rootDepthMap[depth];
                     const charId = t.characterId ?? t.id;
@@ -1377,7 +1776,9 @@ export class GFXParser {
                         const opacity = extractOpacity(t.colorTransform);
                         // Pass frame relative to when the sprite was placed, so it runs its own timeline
                         const relativeFrame = frameIndex - (t._placedAtFrame ?? 0);
-                        instantiate(charId, matrix, '', t.name, undefined, 0, parseInt(depth), 1, 1, opacity, relativeFrame, spriteFrameMap);
+                        const clipInfo = resolveRootClip(parseInt(depth));
+                        const mr = t.ratio != null ? t.ratio / 65535 : 0;
+                        instantiate(charId, matrix, '', t.name, undefined, 0, parseInt(depth), 1, 1, opacity, relativeFrame, spriteFrameMap, clipInfo?.groupId, clipInfo?.isMask, mr);
                     }
                 }
             } else {
@@ -1394,11 +1795,7 @@ export class GFXParser {
                                 else {
                                     const prev = depthMap[t.depth];
                                     const isNewPlacement = t.characterId != null && (!prev || prev.characterId !== t.characterId);
-                                    depthMap[t.depth] = {
-                                        ...prev,
-                                        ...t,
-                                        _placedAtFrame: isNewPlacement ? f : (prev?._placedAtFrame ?? f),
-                                    };
+                                    depthMap[t.depth] = mergeDepthEntry(prev, t, isNewPlacement ? f : (prev?._placedAtFrame ?? f));
                                 }
                             }
                         }
@@ -1420,6 +1817,20 @@ export class GFXParser {
                             });
                         }
                     }
+                    type ClipRangeS = { fromDepth: number; toDepth: number; groupId: string };
+                    const sprClipRanges: ClipRangeS[] = [];
+                    for (const dStr of Object.keys(depthMap)) {
+                        const td = depthMap[+dStr];
+                        if (td.clipDepth > 0) sprClipRanges.push({ fromDepth: parseInt(dStr), toDepth: td.clipDepth, groupId: `clip_${contextId}_${dStr}` });
+                    }
+                    const resolveSprClip = (d: number): { groupId: string; isMask: boolean } | null => {
+                        for (const cr of sprClipRanges) {
+                            if (d === cr.fromDepth) return { groupId: cr.groupId, isMask: true };
+                            if (d > cr.fromDepth && d <= cr.toDepth) return { groupId: cr.groupId, isMask: false };
+                        }
+                        return null;
+                    };
+
                     for (const depth in depthMap) {
                         const t = depthMap[depth];
                         const charId = t.characterId ?? t.id;
@@ -1427,7 +1838,9 @@ export class GFXParser {
                             const matrix = extractMatrix(t.matrix);
                             const opacity = extractOpacity(t.colorTransform);
                             const relativeFrame = frameIndex - (t._placedAtFrame ?? 0);
-                            instantiate(charId, matrix, '', t.name, undefined, def.id, parseInt(depth), 1, 1, opacity, relativeFrame, spriteFrameMap);
+                            const clipInfo = resolveSprClip(parseInt(depth));
+                            const mr = t.ratio != null ? t.ratio / 65535 : 0;
+                            instantiate(charId, matrix, '', t.name, undefined, def.id, parseInt(depth), 1, 1, opacity, relativeFrame, spriteFrameMap, clipInfo?.groupId, clipInfo?.isMask, mr);
                         }
                     }
                 }
@@ -1652,6 +2065,17 @@ export class GFXParser {
                         color: { r: +m[0], g: +m[1], b: +m[2], a: m[3] != null ? +m[3] : 255 },
                     });
                 }
+            }
+        }
+
+        // Replay any ABC patches that were applied via the script editor.
+        // this._patcher holds the live in-memory patched state; compile() creates a
+        // fresh patcher from the original file, so we must re-apply ABC changes here.
+        if (this._patcher) {
+            for (const [abcKey] of this._patcher.doAbcMap.entries()) {
+                const liveBytes = this._patcher.readDoABCBytes(abcKey);
+                if (!liveBytes || liveBytes.length === 0) continue;
+                patcher.patchDoABC(abcKey, liveBytes);
             }
         }
 

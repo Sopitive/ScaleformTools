@@ -325,10 +325,13 @@ export function mergeClassIntoABC(
   const origCI = findClass(orig);
   const neuCI  = findClass(neu);
 
-  if (origCI === -1 || neuCI === -1) {
-    // Class not found — return original unchanged, log which side failed
-    console.warn(`mergeClassIntoABC: class "${className}" not found in ${origCI === -1 ? 'original' : 'compiled'} ABC`);
-    return origBytes;
+  if (origCI === -1) {
+    const available = orig.instances.map(i => mnStr(orig, i.nameIdx)).join(', ');
+    throw new Error(`Class "${className}" not found in original ABC. Available: ${available || '(none)'}`);
+  }
+  if (neuCI === -1) {
+    const available = neu.instances.map(i => mnStr(neu, i.nameIdx)).join(', ');
+    throw new Error(`Class "${className}" not found in compiled ABC. Available: ${available || '(none)'}`);
   }
 
   // ── 2. Extend orig constant pools with any new entries from neu ────────────
@@ -448,22 +451,34 @@ export function mergeClassIntoABC(
   };
 
   // ── 4. Replace method bodies for the target class ─────────────────────────
+  let replacedCount = 0;
+  const unmatchedNeu: string[] = [];
+
   for (const nm of neuMethods) {
     const neuBody = neu.bodies.get(nm.midx);
     if (!neuBody) continue;
     const om = origMethods.find(m => m.name === nm.name);
-    if (!om) continue;
+    if (!om) { unmatchedNeu.push(nm.name); continue; }
 
     const remappedCode = remapBytecode(neuBody.code, rt);
     const origBody = orig.bodies.get(om.midx);
     if (origBody) {
-      // Update existing body
       origBody.code = remappedCode;
       origBody.maxStack   = Math.max(origBody.maxStack, neuBody.maxStack);
       origBody.localCount = Math.max(origBody.localCount, neuBody.localCount);
       origBody.maxScope   = Math.max(origBody.maxScope, neuBody.maxScope);
+      replacedCount++;
     }
-    // If no origBody exists (method was added), we skip it for now
+  }
+
+  if (replacedCount === 0) {
+    const origNames = origMethods.map(m => m.name).join(', ');
+    const neuNames  = neuMethods.map(m => m.name).join(', ');
+    throw new Error(
+      `Merge produced no changes — no method bodies matched.\n` +
+      `Original methods: ${origNames || '(none)'}\n` +
+      `Compiled methods: ${neuNames || '(none)'}`
+    );
   }
 
   // ── 5. Serialise the modified original ABC ─────────────────────────────────

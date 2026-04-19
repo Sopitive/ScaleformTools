@@ -1102,6 +1102,13 @@ export class GFXPatcher {
     return true;
   }
 
+  /** Return the current (possibly-patched) raw ABC bytes for a given DoABC key. */
+  public readDoABCBytes(abcKey: string): Uint8Array | null {
+    const entry = this.doAbcMap.get(abcKey);
+    if (!entry) return null;
+    return this.decompressed.slice(entry.abcDataOffset, entry.bodyOffset + entry.bodyLength);
+  }
+
   // ── EditText field patching ───────────────────────────────────────────────
 
   private _writeUI16(offset: number, value: number) {
